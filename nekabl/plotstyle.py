@@ -316,3 +316,154 @@ def height_legend(ax, heights, title=None, **kw):
     leg = ax.legend(handles=h, title=title, title_fontsize=STYLE["legend_size"], **kw)
     ax.add_artist(leg)
     return leg
+
+
+def curves_legend(ax, data, loc_runs="upper right", loc_heights="lower left", extra=None):
+    """Legends for 'one curve per height' plots: a single legend (colour =
+    height) for one simulation, two compact legends (colours = simulations,
+    line styles = heights of the first one) for several."""
+    if len(data) == 1:
+        ax.legend()
+        return
+    run_legend(ax, list(data), loc=loc_runs)
+    zs = [(np.asarray(d.z.values, float), d.attrs.get("zi")) for d in data.values()]
+    if all(zi for _, zi in zs):      # same z/zi in every run -> label the heights in z/zi
+        rel = [z / zi for z, zi in zs]
+        if all(r.shape == rel[0].shape and np.allclose(r, rel[0], atol=0.02) for r in rel):
+            from matplotlib.lines import Line2D
+            h = [Line2D([], [], color="0.3", ls=HEIGHT_STYLES[j % len(HEIGHT_STYLES)],
+                        label=f"$z/z_i$ = {r:.2g}") for j, r in enumerate(rel[0])]
+            ax.add_artist(ax.legend(handles=h, loc=loc_heights))
+            return
+    height_legend(ax, zs[0][0], loc=loc_heights, title=list(data)[0] if len(data) > 1 else None)
+
+
+def zlabel(ax, zi=None):
+    """Vertical-axis label (z or z/zi), only on the first of y-shared panels."""
+    shared = len(ax.get_shared_y_axes().get_siblings(ax)) > 1
+    ss = ax.get_subplotspec()
+    if not shared or ss is None or ss.is_first_col():
+        ax.set_ylabel(label("z/zi" if zi else "z"))
+
+
+def save(fig, name, folder=None, fmt=None, **kw):
+    """Save a figure as <figure_dir>/<name>.<save_format>; returns the path."""
+    folder = folder or STYLE["figure_dir"]
+    os.makedirs(folder, exist_ok=True)
+    fmt = fmt or STYLE["save_format"]
+    path = os.path.join(folder, f"{name}.{fmt}")
+    fig.savefig(path, **kw)
+    return path
+
+
+def symmetric_limits(a, q=99.5):
+    """Symmetric colour limits (percentile, robust to spikes) for signed data."""
+    v = np.nanpercentile(np.abs(np.asarray(a)), q)
+    return -v, v
+
+
+# ----------------------------------------------------------------------------
+# Labels (math text works with and without LaTeX)
+# ----------------------------------------------------------------------------
+LABELS = {
+    "z": r"$z$ (m)",
+    "z/zi": r"$z/z_i$",
+    "time": r"$t$ (s)",
+    "U": r"$\langle u\rangle$ (m s$^{-1}$)",
+    "V": r"$\langle v\rangle$ (m s$^{-1}$)",
+    "W": r"$\langle w\rangle$ (m s$^{-1}$)",
+    "M": r"$M=\sqrt{U^2+V^2}$ (m s$^{-1}$)",
+    "wdir": r"wind direction ($^\circ$)",
+    "T": r"$\langle\theta\rangle$ (K)",
+    "P": r"$\langle p\rangle$ (m$^2$ s$^{-2}$)",
+    "uu": r"$\langle u'u'\rangle$ (m$^2$ s$^{-2}$)",
+    "vv": r"$\langle v'v'\rangle$ (m$^2$ s$^{-2}$)",
+    "ww": r"$\langle w'w'\rangle$ (m$^2$ s$^{-2}$)",
+    "uv": r"$\langle u'v'\rangle$ (m$^2$ s$^{-2}$)",
+    "uw": r"$\langle u'w'\rangle$ (m$^2$ s$^{-2}$)",
+    "vw": r"$\langle v'w'\rangle$ (m$^2$ s$^{-2}$)",
+    "tt": r"$\langle\theta'\theta'\rangle$ (K$^2$)",
+    "wt": r"$\langle w'\theta'\rangle$ (K m s$^{-1}$)",
+    "ut": r"$\langle u'\theta'\rangle$ (K m s$^{-1}$)",
+    "vt": r"$\langle v'\theta'\rangle$ (K m s$^{-1}$)",
+    "tke": r"$k_{res}$ (m$^2$ s$^{-2}$)",
+    "tau": r"$|\tau|$ (m$^2$ s$^{-2}$)",
+    "nut": r"$\langle\nu_t\rangle$ (m$^2$ s$^{-1}$)",
+    "alpha_t": r"$\langle\alpha_t\rangle$ (m$^2$ s$^{-1}$)",
+    "Pr_sgs": r"$\langle\nu_t\rangle/\langle\alpha_t\rangle$",
+    "Ri_g": r"$Ri_g$",
+    "Ri_f": r"$Ri_f$",
+    "N2": r"$N^2$ (s$^{-2}$)",
+    "dUdz": r"$\partial U/\partial z$ (s$^{-1}$)",
+    "dTdz": r"$\partial\Theta/\partial z$ (K m$^{-1}$)",
+    "Sw": r"$S_w$",
+    "St": r"$S_\theta$",
+    "K_m": r"$K_m$ (m$^2$ s$^{-1}$)",
+    "K_h": r"$K_h$ (m$^2$ s$^{-1}$)",
+    "Pr_t": r"$Pr_t$",
+    "ustar": r"$u_*$ (m s$^{-1}$)",
+    "L": r"$L$ (m)",
+    "zi": r"$z_i$ (m)",
+    "wstar": r"$w_*$ (m s$^{-1}$)",
+    "zi_L": r"$-z_i/L$",
+    "wt_s": r"$\langle w'\theta'\rangle_s$ (K m s$^{-1}$)",
+    "thetastar": r"$\theta_*$ (K)",
+    "t_conv": r"$z_i/w_*$ (s)",
+    "h_ekman": r"$u_*/|f|$ (m)",
+    "tke_sgs": r"$e_{sgs}$ (m$^2$ s$^{-2}$)",
+    "tke_res_frac": r"$k_{res}/(k_{res}+e_{sgs})$",
+    "e": r"$e_{sgs}$ (m$^2$ s$^{-2}$)",
+    "Ri_b": r"$Ri_b$",
+    "Q_cross": r"cross-isobaric $Q_\perp$ (m$^2$ s$^{-1}$)",
+    "Q_along": r"along-isobaric $Q_\parallel$ (m$^2$ s$^{-1}$)",
+    "alpha": r"turning angle ($^\circ$)",
+    "alpha_s": r"surface turning angle ($^\circ$)",
+    "S": r"$S=|\partial\mathbf{U}/\partial z|$ (s$^{-1}$)",
+    "dVdz": r"$\partial V/\partial z$ (s$^{-1}$)",
+    "Su": r"$S_u$", "Sv": r"$S_v$", "Kw": r"$K_w$",
+    "www": r"$\langle w'w'w'\rangle$ (m$^3$ s$^{-3}$)",
+    "wtt": r"$\langle w'\theta'\theta'\rangle$ (K$^2$ m s$^{-1}$)",
+    "wwt": r"$\langle w'w'\theta'\rangle$ (K m$^2$ s$^{-2}$)",
+    "tke_tot": r"$k_{res}+e_{sgs}$ (m$^2$ s$^{-2}$)",
+    "u": r"$u$ (m s$^{-1}$)", "v": r"$v$ (m s$^{-1}$)", "w": r"$w$ (m s$^{-1}$)",
+    "t": r"$\theta$ (K)", "p": r"$p$ (m$^2$ s$^{-2}$)",
+}
+
+
+def add_scalar_labels(sym, name=None, units="a.u."):
+    """Register axis labels of a passive scalar with one-letter symbol `sym`
+    (mean, gradient, variance, fluxes): called by Run for every scalar found."""
+    if sym == "t":
+        return
+    n = name or sym
+    S = sym.upper()
+    u = f" ({units})" if units else ""
+    LABELS.update({
+        S: rf"$\langle {n}\rangle${u}",
+        f"d{S}dz": rf"$\partial\langle {n}\rangle/\partial z$ ({units} m$^{{-1}}$)",
+        f"{sym}{sym}": rf"$\langle {n}'{n}'\rangle$ ({units}$^2$)",
+        f"w{sym}": rf"$\langle w'{n}'\rangle$ ({units} m s$^{{-1}}$)",
+        f"u{sym}": rf"$\langle u'{n}'\rangle$ ({units} m s$^{{-1}}$)",
+        f"v{sym}": rf"$\langle v'{n}'\rangle$ ({units} m s$^{{-1}}$)",
+        f"S{sym}": rf"$S_{{{n}}}$",
+        f"alpha_{sym}": rf"$\langle\alpha_{{{n}}}\rangle$ (m$^2$ s$^{{-1}}$)",
+    })
+
+
+def label(var):
+    """Axis label of a variable name (falls back to the name itself).
+
+    Suffixes are understood: 'uw_sgs', 'uw_tot', 'tke_sgs' ...
+    """
+    if var in LABELS:
+        return LABELS[var]
+    for suf, tag in (("_sgs", "sgs"), ("_tot", "tot"), ("_res", "res")):
+        if var.endswith(suf) and var[: -len(suf)] in LABELS:
+            base = LABELS[var[: -len(suf)]]
+            if "\\rangle" in base:
+                return base.replace("\\rangle$", f"\\rangle_{{{tag}}}$", 1)
+            return f"{base} [{tag}]"
+    return var
+
+
+apply()
