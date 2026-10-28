@@ -158,3 +158,161 @@ def run_height_style(i_run, j_height, n_runs):
     if n_runs == 1:
         return color(j_height), "-"
     return color(i_run), HEIGHT_STYLES[j_height % len(HEIGHT_STYLES)]
+
+
+def as_dict(obj, labels=None):
+    """Dataset / list / dict of Datasets (one per simulation) -> {label: Dataset}.
+
+    Labels come from `labels`, else ds.attrs['label'], else 'run 1', 'run 2' ..."""
+    if isinstance(obj, dict):
+        return obj
+    if not isinstance(obj, (list, tuple)):
+        obj = [obj]
+    if isinstance(labels, str):
+        labels = [labels]
+    out = {}
+    for i, d in enumerate(obj):
+        lab = labels[i] if labels else getattr(d, "attrs", {}).get("label", f"run {i + 1}")
+        out[lab] = d
+    return out
+
+
+def zcoord(ds, zi=None):
+    """Vertical coordinate for plots: z, z/zi (number), or z/zi with the zi of
+    each dataset (zi=True or 'auto' -> ds.attrs['zi'])."""
+    if zi is None or zi is False:
+        return ds.z
+    if zi is True or zi == "auto":
+        return ds.z / ds.attrs["zi"]
+    return ds.z / zi
+
+
+def evolution_times(evo):
+    """Times of the evolution profiles (end of each statistics window)."""
+    return np.asarray(evo.time.values, float)
+
+
+def evolution_color(evo, t):
+    """Colour of the profile at time t (STYLE['evolution_cmap'] over the time range)."""
+    tt = evolution_times(evo)
+    f = 0.5 if tt[-1] == tt[0] else (t - tt[0]) / (tt[-1] - tt[0])
+    return plt.get_cmap(STYLE["evolution_cmap"])(f)
+
+
+def evolution_lines(ax, evo, var_or_func, zc_func, zorder=1):
+    """Draw every profile of `evo` (a (time, z) Dataset) as a thin, transparent
+    line behind the mean, coloured by time (STYLE['evolution_cmap']; viridis_r:
+    yellow = first window, violet = last). var_or_func: name, or a function
+    ds -> DataArray. zc_func: ds -> vertical coordinate. Returns the x values
+    drawn (for axis limits)."""
+    if evo is None or "time" not in evo.dims:
+        return []
+    vals = []
+    for i in range(evo.time.size):
+        d = evo.isel(time=i)
+        try:
+            da = var_or_func(d) if callable(var_or_func) else d.get(var_or_func)
+        except (KeyError, ValueError, StopIteration):
+            da = None
+        if da is None:
+            continue
+        ax.plot(da, zc_func(d), color=evolution_color(evo, float(d.time)), lw=STYLE["evolution_lw"],
+                alpha=STYLE["evolution_alpha"], zorder=zorder)
+        vals.append(np.asarray(da))
+    return vals
+
+
+def mean_color(i, evo=None):
+    """Colour of the mean profile of simulation i: the simulation colour, or
+    STYLE['evolution_mean_color'] when the evolution lines are drawn."""
+    return STYLE["evolution_mean_color"] if evo is not None else color(i)
+
+
+def mean_lw(evo=None):
+    """Line width of the mean profile (thicker on top of the evolution lines)."""
+    return STYLE["line_width"] * (1.4 if evo is not None else 1.0)
+
+
+def evolution_colorbar(fig, axs, evo, **kw):
+    """Colour bar of the evolution lines (time of each window). Returns it."""
+    if evo is None or "time" not in evo.dims:
+        return None
+    import matplotlib as mpl
+    tt = evolution_times(evo)
+    sm = mpl.cm.ScalarMappable(cmap=STYLE["evolution_cmap"],
+                               norm=mpl.colors.Normalize(tt[0], tt[-1] if tt[-1] > tt[0] else tt[0] + 1))
+    kw = {"shrink": 0.8, "aspect": 30, "pad": 0.01, **kw}
+    cb = fig.colorbar(sm, ax=np.ravel(axs).tolist(), **kw)
+    cb.set_label(r"profile time $t$ (s, end of window)", fontsize=STYLE["legend_size"])
+    cb.ax.tick_params(labelsize=STYLE["legend_size"])
+    cb.formatter = mpl.ticker.FuncFormatter(lambda v, _: f"{v:.0f}")
+    cb.update_ticks()
+    return cb
+
+
+def _window_text(ds):
+    """'t0-t1 s, N windows of D s' from the attrs set by time_average."""
+    a = ds.attrs
+    if "t0" not in a or "t1" not in a:
+        return None
+    n = a.get("n_windows")
+    if a.get("source") == "field files":      # snapshots: no averaging windows
+        t_first = a["t0"] + (a.get("window_min") or 0.0)
+        return f"{t_first:.0f}-{a['t1']:.0f} s ({n} snapshot{'s' if n != 1 else ''})"
+    txt = f"{a['t0']:.0f}-{a['t1']:.0f} s"
+    w0, w1 = a.get("window_min"), a.get("window_max")
+    if n and w0 and w1:
+        dt = f"{w0:.0f} s" if abs(w1 - w0) <= 0.02 * w1 else f"{w0:.0f}-{w1:.0f} s"
+        txt += f" ({n} window{'s' if n > 1 else ''}, stats every {dt})"
+    elif n:
+        txt += f" ({n} windows)"
+    return txt
+
+
+def average_title(fig, data, evo=None, title=None):
+    """Figure title with the averaging window and output interval of the
+    statistics of every simulation (and the time range of the evolution lines).
+    title: None -> automatic, False -> none, a string -> that string."""
+    if title is False:
+        return
+    if title is None:
+        parts = []
+        for lab, ds in data.items():
+            w = _window_text(ds)
+            if w:
+                parts.append(f"mean {w}" if len(data) == 1 else f"{lab}: {w}")
+        if evo is not None and "time" in evo.dims:
+            tt = evolution_times(evo)
+            parts.append(f"thin lines: {tt.size} windows ending {tt[0]:.0f}-{tt[-1]:.0f} s")
+        title = ";  ".join(parts)
+    if title:
+        fig.suptitle(title, fontsize=STYLE["title_size"], color="0.25")
+
+
+def component_legend(ax, components=("total", "res", "sgs"), names=None, **kw):
+    """Extra legend explaining the line styles (in neutral grey)."""
+    from matplotlib.lines import Line2D
+    names = names or dict(total="total", res="resolved", sgs="SGS", model="model", ref="reference")
+    h = [Line2D([], [], color="0.3", ls=ls(c), label=names.get(c, c)) for c in components]
+    leg = ax.legend(handles=h, **kw)
+    ax.add_artist(leg)
+    return leg
+
+
+def run_legend(ax, labels, **kw):
+    """Legend of the simulations (colours)."""
+    from matplotlib.lines import Line2D
+    h = [Line2D([], [], color=color(i), label=l) for i, l in enumerate(labels)]
+    leg = ax.legend(handles=h, **kw)
+    ax.add_artist(leg)
+    return leg
+
+
+def height_legend(ax, heights, title=None, **kw):
+    """Legend of the line styles used for heights (when colour = simulation)."""
+    from matplotlib.lines import Line2D
+    h = [Line2D([], [], color="0.3", ls=HEIGHT_STYLES[j % len(HEIGHT_STYLES)], label=f"z = {z:.0f} m")
+         for j, z in enumerate(heights)]
+    leg = ax.legend(handles=h, title=title, title_fontsize=STYLE["legend_size"], **kw)
+    ax.add_artist(leg)
+    return leg
