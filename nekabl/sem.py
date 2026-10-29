@@ -47,7 +47,18 @@ def lagrange_matrix(xi, xt):
 
 def derivative_matrix(N):
     """GLL collocation derivative matrix on [-1, 1]: (df/dxi)_i = D_ij f_j."""
-    raise NotImplementedError
+    xi, _ = gll(N)
+    cN = np.zeros(N + 1)
+    cN[N] = 1.0
+    PN = _leg.legval(xi, cN)
+    D = np.zeros((N + 1, N + 1))
+    for i in range(N + 1):
+        for j in range(N + 1):
+            if i != j:
+                D[i, j] = PN[i] / (PN[j] * (xi[i] - xi[j]))
+    D[0, 0] = -N * (N + 1) / 4.0
+    D[N, N] = N * (N + 1) / 4.0
+    return D
 
 
 # ----------------------------------------------------------------------------
