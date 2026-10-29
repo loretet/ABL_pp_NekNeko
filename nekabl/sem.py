@@ -120,3 +120,108 @@ class Axis:
             xloc = 2.0 * (xt[sel] - self.edges[k]) / self.h[k] - 1.0
             M[np.ix_(sel, np.arange(k * self.N, (k + 1) * self.N + 1))] = lagrange_matrix(self.xi, xloc)
         return M
+
+
+class FDAxis:
+    """Finite-difference fallback with the same interface as `Axis`."""
+
+    kind = "fd"
+
+    def __init__(self, coord):
+        self.coord = np.asarray(coord, float)
+        self.n = self.coord.size
+        self.N = None
+
+    def weights(self):
+        z = self.coord
+        if self.n == 1:
+            return np.ones(1)
+        dz = np.diff(z)
+        w = np.zeros(self.n)
+        w[:-1] += dz / 2
+        w[1:] += dz / 2
+        return w
+
+    def derivative(self):
+        return np.gradient(np.eye(self.n), self.coord, axis=0)
+
+    def diff(self, arr, axis=-1):
+        return np.gradient(np.asarray(arr, float), self.coord, axis=axis)
+
+    def interpolation(self, xt):
+        xt = np.atleast_1d(np.asarray(xt, float))
+        I = np.eye(self.n)
+        return np.stack([np.interp(xt, self.coord, I[:, j]) for j in range(self.n)], axis=1)
+
+
+def is_gll_axis(coord, N, rtol=1e-4):
+    """Check whether `coord` is a sequence of GLL elements of order N."""
+    coord = np.asarray(coord, float)
+    if N is None or N < 1 or (coord.size - 1) % N != 0 or coord.size < N + 1:
+        return False
+    xi, _ = gll(N)
+    edges = coord[::N]
+    L = coord[-1] - coord[0]
+    for e in range(edges.size - 1):
+        loc = coord[e * N:(e + 1) * N + 1]
+        ref = edges[e] + (xi + 1) / 2 * (edges[e + 1] - edges[e])
+        if np.max(np.abs(loc - ref)) > rtol * L:
+            return False
+    return True
+
+
+def make_axis(coord, N=None):
+    """Return an `Axis` if coord has a GLL structure of order N, else `FDAxis`."""
+    if N is not None and is_gll_axis(coord, N):
+        return Axis(coord, N)
+    return FDAxis(coord)
+
+
+# ----------------------------------------------------------------------------
+# Applying axis operators to xarray objects
+# ----------------------------------------------------------------------------
+def apply_along(da, M, dim, new_coord=None):
+    """Apply matrix M (nnew, nold) along dimension `dim` of a DataArray."""
+    import xarray as xr
+
+    ax = da.get_axis_num(dim)
+    out = np.moveaxis(np.tensordot(M, np.moveaxis(da.values, ax, 0), axes=(1, 0)), 0, ax)
+    if new_coord is None:   # same points: keep every coordinate (and its attrs)
+        coords = da.coords
+    else:
+        coords = {k: v for k, v in da.coords.items() if dim not in v.dims}
+        coords[dim] = new_coord
+    return xr.DataArray(out, dims=da.dims, coords=coords, name=da.name, attrs=da.attrs)
+
+
+def axis_of(obj, dim="z"):
+    """Build the Axis of dimension `dim` of a Dataset/DataArray.
+
+    The polynomial order is stored as an attribute of the coordinate itself
+    (``obj[dim].attrs['N']``) so that it survives xarray arithmetic.
+    """
+    N = obj[dim].attrs.get("N", obj.attrs.get("N", None))
+    return make_axis(obj[dim].values, N)
+
+
+def ddz(da, dim="z", axis=None):
+    """Derivative of a DataArray along `dim` (spectral if GLL, else 2nd-order
+    FD). Works for any dim: ddz(fld.u, 'x') is du/dx."""
+    axis = axis or axis_of(da, dim)
+    return da.copy(data=axis.diff(da.values, da.get_axis_num(dim)))
+
+
+def integrate(da, dim="z", axis=None):
+    """Integral of a DataArray along `dim` with the proper quadrature."""
+    import xarray as xr
+
+    axis = axis or axis_of(da, dim)
+    w = xr.DataArray(axis.weights(), dims=dim, coords={dim: da[dim]})
+    return (da * w).sum(dim)
+
+
+def interp(da, values, dim="z", axis=None):
+    """Interpolate a DataArray along `dim` at `values` (spectral if GLL)."""
+    axis = axis or axis_of(da, dim)
+    values = np.atleast_1d(values)
+    return apply_along(da, axis.interpolation(values), dim, new_coord=values)
