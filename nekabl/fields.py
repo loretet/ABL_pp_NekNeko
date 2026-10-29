@@ -167,3 +167,114 @@ def _mesh_structure(mesh_path):
         st[name] = g.mean(axis=others)
     _MESH_CACHE[key] = st
     return st
+
+
+def _assemble(f_el, st):
+    """Element data (nel, lz, ly, lx), sorted by global element id -> global array.
+
+    Values at nodes shared by several elements are AVERAGED (as Neko/Nek5000
+    gather-scatter do). Also returns the largest difference between the copies
+    of a shared node ('interface jump'): 0 for continuous (C0) fields such as
+    velocity, > 0 for element-wise quantities (e.g. nu_t, filter width).
+    """
+    li, cnt = st["li"], st["count"]
+    f = f_el.ravel()
+    m = np.bincount(li, weights=f, minlength=cnt.size) / cnt
+    m2 = np.bincount(li, weights=f * f, minlength=cnt.size) / cnt
+    jump = float(np.sqrt(np.maximum(m2 - m * m, 0)).max()) * 2.0
+    return m.reshape(st["shape"]), jump
+
+
+def _default_mesh(path):
+    """field0.f00007 -> field0.f00000 (Neko writes the mesh only in the first file)."""
+    folder, name = os.path.split(path)
+    m = re.match(r"(.*\.f)(\d+)$", name)
+    if m is None:
+        return path
+    return os.path.join(folder, m.group(1) + "0" * len(m.group(2)))
+
+
+def _y_up(ds):
+    """Nek5000 convention (y vertical) -> package convention (z vertical).
+
+    Proper rotation (no mirror, so Coriolis veering keeps its sign):
+        x -> x,   y_nek -> z,   z_nek -> -y
+        u -> u,   v_nek -> w,   w_nek -> -v
+    For 2D (x, y_nek) files only the vertical coordinate is renamed.
+    """
+    if "z" not in ds.dims:                               # 2D: (y, x) -> (z, x)
+        out = ds.rename({"y": "z", "wy": "wz"})
+        if "v" in out:
+            out = out.rename({"v": "w"})
+        return out
+    out = xr.Dataset(attrs=ds.attrs)
+    y_new = -ds.z.values[::-1]
+    coords = dict(z=xr.DataArray(ds.y.values, dims="z", attrs=ds.y.attrs),
+                  y=xr.DataArray(y_new, dims="y", attrs=ds.z.attrs),
+                  x=ds.x)
+    out = out.assign_coords(coords)
+    out = out.assign_coords(wz=("z", ds.wy.values), wy=("y", ds.wz.values[::-1]), wx=ds.wx)
+    for k, da in ds.data_vars.items():
+        a = da.transpose(..., "y", "z", "x").values[..., ::-1, :]   # (.., z_new, y_new, x)
+        dims = da.dims[:-3] + ("z", "y", "x")
+        if k == "v":
+            out["w"] = (dims, a)
+        elif k == "w":
+            out["v"] = (dims, -a)
+        else:
+            out[k] = (dims, a)
+        out[k if k not in ("v", "w") else ("w" if k == "v" else "v")].attrs.update(da.attrs)
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Public API
+# ----------------------------------------------------------------------------
+def read_field(path, variables=None, rename=None, mesh=None, vertical="z"):
+    """Read one field file into an xarray Dataset with dims (z, y, x)
+    ((z, x) for 2D files, e.g. spanwise-averaged statistics).
+
+    Parameters
+    ----------
+    path      : fld file (e.g. 'output/field0.f00003').
+    variables : list of slot names to read ('u','v','w','p','t','s1',...);
+                None reads everything.
+    rename    : dict to rename slots, e.g. {'s1': 'e', 's3': 'nut'}.
+    mesh      : file holding the coordinates (default: the matching *.f00000).
+    vertical  : 'z' (Neko ABL cases) or 'y' (Nek5000 cases with y up): the
+                data are rotated so that z is always the vertical (see _y_up).
+
+    Shared element-face nodes are averaged; the largest difference between the
+    copies of a node is stored in each variable's attrs['interface_jump'].
+    """
+    rename = rename or {}
+    inv = {v: k for k, v in rename.items()}
+    if variables is not None:
+        variables = [inv.get(v, v) for v in variables]
+        if vertical == "y":   # asked in package names -> file slots
+            variables = [{"v": "w", "w": "v"}.get(v, v) for v in variables]
+    hdr = read_header(path)
+    mesh = mesh or (path if "X" in hdr["code"] else _default_mesh(path))
+    st = _mesh_structure(mesh)
+    hdr, emap, d = _read_raw(path, variables, hdr)
+    order = np.argsort(emap)
+    N = st["N"]
+    names = ("x", "y", "z")[:st["gdim"]]
+    ds = xr.Dataset(coords={k: xr.DataArray(st[k], dims=k, attrs={"N": N}) for k in names})
+    for k in names:
+        ds.coords["w" + k] = (k, sem.Axis(st[k], N).weights())
+    dims = names[::-1]
+    for name, arr in d.items():
+        if name in ("x", "y", "z"):
+            continue
+        g, jump = _assemble(arr[order], st)
+        ds[name] = (dims, g)
+        ds[name].attrs["interface_jump"] = jump
+    if vertical == "y":
+        ds = _y_up(ds)
+    elif vertical != "z":
+        raise ValueError("vertical must be 'z' or 'y'")
+    ds = ds.rename({k: v for k, v in rename.items() if k in ds})
+    ds.attrs.update(time=hdr["time"], step=hdr["step"], N=N, file=os.path.abspath(path),
+                    vertical_in_file=vertical)
+    return ds
