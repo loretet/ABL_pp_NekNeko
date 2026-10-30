@@ -345,3 +345,113 @@ def derive(raw, case=None, g=None, T0=None, sym="t", nu=None):
             break
     out.z.attrs.update(raw.z.attrs)
     return out
+
+
+# ----------------------------------------------------------------------------
+# Raw moments from field files
+# ----------------------------------------------------------------------------
+DEFAULT_FIELD_MOMENTS = ["u", "v", "w", "p", "t", "uu", "vv", "ww", "uv", "uw", "vw", "pp",
+                         "ut", "vt", "wt", "tt", "www", "uuw", "vvw", "wwt", "wtt", "pw"]
+
+
+def from_fields(fld, moments=None, extra=None):
+    """Horizontally averaged raw moments from field snapshots.
+
+    fld     : Dataset from fields.read_fields (time, z, y, x) or one snapshot.
+    moments : list of products of single-letter variables ('uw', 'wtt', ...);
+              default DEFAULT_FIELD_MOMENTS (those that exist in fld).
+    extra   : names of other variables whose horizontal mean is wanted
+              (e.g. ['e', 'nut']).
+    Returns a raw Dataset (time, z) usable with time_average/derive. Each
+    snapshot gets the same weight.
+    """
+    from .fields import hmean
+
+    moments = moments or DEFAULT_FIELD_MOMENTS
+    out = {}
+    for m in moments:
+        if all(c in fld for c in m):
+            prod = fld[m[0]]
+            for c in m[1:]:
+                prod = prod * fld[c]
+            out[m] = hmean(prod)
+    for m in extra or []:
+        if m in fld:
+            out[m] = hmean(fld[m])
+    ds = xr.Dataset(out)
+    ds = ds.drop_vars([c for c in ("wz",) if c in ds.coords])
+    if "time" in ds.dims:
+        ds = ds.assign_coords(window=("time", np.ones(ds.time.size)))
+    ds.z.attrs.update(fld.z.attrs)
+    ds.attrs["source"] = "field files"
+    return ds
+
+
+# ----------------------------------------------------------------------------
+# Plots  (colour = simulation, line style = component; see plotstyle.py)
+# ----------------------------------------------------------------------------
+def _new_or_given(axs, n, kind="profile"):
+    if axs is None:
+        return ps.subplots(1, n, kind=kind)
+    axs = np.atleast_1d(axs)
+    return axs.ravel()[0].figure, axs
+
+
+def _evolution(data, evolution):
+    """The evolution Dataset if it can be drawn (one simulation), else None."""
+    if evolution is None:
+        return None
+    if len(data) > 1:
+        print("[nekabl] profile evolution is drawn only for a single simulation: ignored")
+        return None
+    return evolution
+
+
+def _evo_z(mean, zi):
+    """Vertical coordinate of the evolution lines: z, or z / zi of the MEAN profile."""
+    if zi is True or zi == "auto":
+        zi = mean.attrs["zi"]
+    return (lambda d: d.z) if zi in (None, False) else (lambda d: d.z / zi)
+
+
+def plot_profiles(prof, variables, zi=None, zmax=None, labels=None, axs=None, evolution=None, title=None, **kw):
+    """Mean profiles, one panel per variable, one colour per simulation.
+
+    prof      : derived Dataset (z), or list / dict {label: Dataset} of
+                several simulations (or averaging windows) to compare.
+    variables : name or list of names (e.g. ['M', 'T', 'tke']).
+    zi        : None -> z in m; a number -> z/zi; True -> z/zi using each
+                dataset's own attrs['zi'] (set by Run.profile).
+    zmax      : top of the vertical axis (same units as the axis).
+    evolution : (time, z) derived profiles (e.g. run.evolution(5000, 10000)),
+                drawn as thin transparent lines behind the mean (one
+                simulation only; z/zi uses the zi of the mean profile),
+                coloured by time (viridis_r: yellow = first, violet = last);
+                the mean is then drawn in black.
+    title     : None -> averaging window and output interval of the statistics
+                (only for a new figure), False -> none, or a string.
+    """
+    variables = [variables] if isinstance(variables, str) else list(variables)
+    data = ps.as_dict(prof, labels)
+    evo = _evolution(data, evolution)
+    created = axs is None
+    fig, axs = _new_or_given(axs, len(variables))
+    axs = np.atleast_1d(axs)
+    for i, (lab, ds) in enumerate(data.items()):
+        for ax, var in zip(axs, variables):
+            if evo is not None and var in evo:
+                ps.evolution_lines(ax, evo, var, _evo_z(ds, zi))
+            if var in ds:
+                kw_ = {"lw": ps.mean_lw(evo), **kw}
+                ax.plot(ds[var], ps.zcoord(ds, zi), color=ps.mean_color(i, evo), label=lab, **kw_)
+    for ax, var in zip(axs, variables):
+        ax.set_xlabel(ps.label(var))
+        ps.zlabel(ax, zi)
+    if zmax is not None:
+        axs[0].set_ylim(0, zmax)
+    if len(data) > 1:
+        axs[0].legend()
+    ps.evolution_colorbar(fig, axs, evo)
+    if title is not False and (title or created):
+        ps.average_title(fig, data, evo, title)
+    return fig, (axs[0] if len(axs) == 1 else axs)
