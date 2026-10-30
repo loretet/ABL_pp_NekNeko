@@ -278,3 +278,135 @@ def read_field(path, variables=None, rename=None, mesh=None, vertical="z"):
     ds.attrs.update(time=hdr["time"], step=hdr["step"], N=N, file=os.path.abspath(path),
                     vertical_in_file=vertical)
     return ds
+
+
+def list_fields(folder, prefix="field0"):
+    """Sorted list of (path, time) of the field files `prefix.f*****` in folder."""
+    files = sorted(glob.glob(os.path.join(folder, f"{prefix}.f[0-9]*")))
+    return [(f, read_header(f)["time"]) for f in files]
+
+
+def read_fields(folder_or_files, prefix="field0", variables=None, rename=None,
+                tmin=None, tmax=None, every=1, mesh=None, vertical="z"):
+    """Read a series of field files into one Dataset with dims (time, z, y, x).
+
+    folder_or_files : output folder (uses `prefix`) or an explicit list of files.
+    tmin, tmax      : keep only snapshots with tmin <= t <= tmax.
+    every           : keep one snapshot every `every`.
+    vertical        : 'z' (Neko) or 'y' (Nek5000 with y up), see read_field.
+    """
+    if isinstance(folder_or_files, (list, tuple)):
+        files = [(f, read_header(f)["time"]) for f in folder_or_files]
+    else:
+        files = list_fields(folder_or_files, prefix)
+    files = [(f, t) for f, t in files
+             if (tmin is None or t >= tmin) and (tmax is None or t <= tmax)][::every]
+    if not files:
+        raise FileNotFoundError("No field files found (check folder / prefix / tmin / tmax).")
+    if mesh is None:
+        first = files[0][0]
+        mesh = first if "X" in read_header(first)["code"] else _default_mesh(first)
+    dss = [read_field(f, variables, rename, mesh=mesh, vertical=vertical) for f, _ in files]
+    out = xr.concat(dss, dim="time", coords="minimal", compat="override", combine_attrs="drop_conflicts")
+    out = out.assign_coords(time=[d.attrs["time"] for d in dss])
+    out.attrs["N"] = dss[0].attrs["N"]
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Basic operations on field Datasets
+# ----------------------------------------------------------------------------
+def hmean(da):
+    """Exact (GLL-weighted) horizontal average over x and y (or x only for
+    2D (z, x) data such as spanwise-averaged statistics)."""
+    dims = [d for d in ("x", "y") if d in da.dims]
+    w = 1.0
+    for d in dims:
+        w = w * da["w" + d]
+    return (da * w).sum(dims) / w.sum()
+
+
+def fluct(da):
+    """Fluctuation with respect to the horizontal mean: f' = f - <f>_xy."""
+    return da - hmean(da)
+
+
+def at_height(obj, z):
+    """Spectral interpolation of a field (DataArray or Dataset) at height(s) z.
+
+    Returns the plane(s) with z as a (length-1 or longer) dimension; use
+    .squeeze('z') for a single plane.
+    """
+    ax = sem.axis_of(obj, "z")
+    M = ax.interpolation(z)
+
+    def _one(da):
+        if "z" not in da.dims:
+            return da
+        return sem.apply_along(da, M, "z", new_coord=np.atleast_1d(z))
+
+    if isinstance(obj, xr.Dataset):
+        out = xr.Dataset({k: _one(v) for k, v in obj.data_vars.items()}, attrs=obj.attrs)
+        return out
+    return _one(obj)
+
+
+def to_uniform(obj, nx=None, ny=None, nz=None):
+    """Spectral interpolation onto a uniform grid in x, y (periodic, end point
+    excluded) and, only if `nz` is given, in z (end points included).
+
+    Uniform grids are what FFTs (spectra, autocorrelations) need.
+    Default nx, ny keep the same number of points as the GLL grid.
+    """
+    out = obj
+    for dim, n in (("x", nx), ("y", ny), ("z", nz)):
+        if dim not in obj.dims and not (isinstance(obj, xr.Dataset) and dim in obj.coords):
+            continue
+        c = obj[dim].values
+        if c.size < 2 or (dim == "z" and n is None):
+            continue
+        if dim in ("x", "y"):
+            n = n or (c.size - 1)
+            new = c[0] + (c[-1] - c[0]) * np.arange(n) / n
+        else:
+            n = n or c.size
+            new = np.linspace(c[0], c[-1], n)
+        ax = sem.axis_of(obj, dim)
+        M = ax.interpolation(new)
+        if isinstance(out, xr.Dataset):
+            out = xr.Dataset({k: (sem.apply_along(v, M, dim, new) if dim in v.dims else v)
+                              for k, v in out.data_vars.items()}, attrs=out.attrs)
+        else:
+            out = sem.apply_along(out, M, dim, new)
+    return out
+
+
+def elementwise_delta(fld, N=None):
+    """Filter width of the 'elementwise_max' type for a box mesh of spectral elements:
+    in every element Delta = (dx dy dz)^(1/3) with dx, dy, dz the LARGEST GLL
+    spacings of the element along each direction, the same for all its nodes
+    (nodes shared by two elements get the larger value). Returns a DataArray on
+    the (z, y, x) lattice of `fld`; use it as fld['delta'] for the Deardorff /
+    SGS-TKE dissipation (turbulence.dissipation_from_fields)."""
+    N = N or fld.attrs.get("N") or fld.z.attrs.get("N")
+    if N is None:
+        raise ValueError("polynomial order N not known: pass N=")
+
+    def max_spacing(c):
+        c = np.asarray(c, float)
+        n = c.size - 1
+        if n % N:
+            raise ValueError("number of points is not a multiple of N + 1: not a box of elements")
+        d = np.abs(np.diff(c))
+        per_el = d.reshape(-1, N).max(axis=1)           # largest spacing in each element
+        out = np.empty(c.size)
+        for i in range(c.size):
+            e0, e1 = max(0, (i - 1) // N), min(n // N - 1, i // N)
+            out[i] = per_el[e0:e1 + 1].max()
+        return out
+
+    dz, dy, dx = (max_spacing(fld[d].values) if d in fld.coords else np.full(1, np.nan)
+                  for d in ("z", "y", "x"))
+    delta = (dz[:, None, None] * dy[None, :, None] * dx[None, None, :]) ** (1.0 / 3.0)
+    return xr.DataArray(delta, dims=("z", "y", "x"),
+                        coords={"z": fld.z, "y": fld.y, "x": fld.x}, name="delta")
