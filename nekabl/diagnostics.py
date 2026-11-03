@@ -359,3 +359,135 @@ def wall_model_check(prof, case, sc=None, verbose=True):
             print(" ! h is above ~0.1-0.15 zi: the sampling point is not in the surface layer")
         print("-----------------------------------------------------------")
     return res
+
+
+# ----------------------------------------------------------------------------
+# SGS and resolution
+# ----------------------------------------------------------------------------
+def sgs_fraction(prof, sym="t"):
+    """SGS fractions of the stress and heat flux, and the SGS Prandtl number.
+    Fractions are masked where the total flux is below 2 % (stress) or 5 %
+    (heat flux) of its maximum."""
+    out = xr.Dataset(coords=prof.coords)
+    if "tau" in prof and "tau_sgs" in prof:
+        out["stress"] = prof.tau_sgs / prof.tau.where(prof.tau > 0.02 * prof.tau.max())
+    wt, wts = f"w{sym}_tot", f"w{sym}_sgs"
+    if wt in prof and wts in prof:
+        tot = prof[wt].where(abs(prof[wt]) > 0.05 * abs(prof[wt]).max())
+        out["heat_flux"] = prof[wts] / tot
+    if "tke_res_frac" in prof:
+        out["tke_sgs"] = 1 - prof.tke_res_frac
+    for k in ("nut", f"alpha_{sym}", "Pr_sgs"):
+        if k in prof:
+            out[k] = prof[k]
+    return out
+
+
+def plot_sgs(prof, zi=None, zmax=None, sym="t", labels=None, axs=None, evolution=None, title=None):
+    """Three panels (one colour per simulation):
+    <nu_t> (solid) and <alpha_t> (dashed);  SGS fraction of the stress (solid),
+    heat flux (dashed) and TKE (dotted);  SGS Prandtl number <nu_t>/<alpha_t>.
+    evolution: (time, z) derived profiles, drawn as thin lines coloured by time
+    (one simulation only; see profiles.plot_profiles). title: see plot_profiles."""
+    from .profiles import _evo_z, _evolution
+    data = ps.as_dict(prof, labels)
+    evo = _evolution(data, evolution)
+    created = axs is None
+    if axs is None:
+        fig, axs = ps.subplots(1, 3)
+    else:
+        fig = axs[0].figure
+    for i, (lab, p) in enumerate(data.items()):
+        fr = sgs_fraction(p, sym)
+        z = ps.zcoord(p, zi)
+        c, lw = ps.mean_color(i, evo), ps.mean_lw(evo)
+        if evo is not None:
+            ez = _evo_z(p, zi)
+            for ax, k in ((axs[0], "nut"), (axs[0], f"alpha_{sym}"), (axs[1], "stress"),
+                          (axs[1], "heat_flux"), (axs[2], "Pr_sgs")):
+                if k in fr:
+                    ps.evolution_lines(ax, evo, lambda d, k=k: sgs_fraction(d, sym).get(k), ez)
+        for k, style in (("nut", "-"), (f"alpha_{sym}", "--")):
+            if k in fr:
+                axs[0].plot(fr[k], z, color=c, ls=style, lw=lw)
+        for k, style in (("stress", "-"), ("heat_flux", "--"), ("tke_sgs", ":")):
+            if k in fr:
+                axs[1].plot(fr[k], z, color=c, ls=style, lw=lw)
+        if "Pr_sgs" in fr:
+            axs[2].plot(fr.Pr_sgs, z, color=c, label=lab, lw=lw)
+    from matplotlib.lines import Line2D
+    frs = [sgs_fraction(p, sym) for p in data.values()]
+    has = lambda k: any(k in f for f in frs)  # noqa: E731
+    axs[0].legend(handles=[Line2D([], [], color="0.3", ls=st, label=lb) for k, st, lb in
+                           (("nut", "-", r"$\nu_t$"), (f"alpha_{sym}", "--", r"$\alpha_t$")) if has(k)])
+    axs[0].set_xlabel(r"(m$^2$ s$^{-1}$)")
+    axs[1].legend(handles=[Line2D([], [], color="0.3", ls=st, label=lb) for k, st, lb in
+                           (("stress", "-", "stress"), ("heat_flux", "--", "heat flux"),
+                            ("tke_sgs", ":", "TKE")) if has(k)])
+    axs[1].set_xlim(-0.1, 1.1)
+    axs[1].set_xlabel("SGS fraction")
+    axs[2].set_xlabel(ps.label("Pr_sgs"))
+    if len(data) > 1:
+        axs[2].legend()
+    for ax in axs:
+        ps.zlabel(ax, zi)
+    if zmax:
+        axs[0].set_ylim(0, zmax)
+    ps.evolution_colorbar(fig, axs, evo)
+    if title is not False and (title or created):
+        ps.average_title(fig, data, evo, title)
+    return fig, axs
+
+
+def resolution(prof, zi, fld=None, verbose=True):
+    """Simple resolution metrics: vertical points in the BL, first-point height,
+    horizontal spacing (if a field Dataset is given), resolved TKE fraction."""
+    z = prof.z.values
+    res = dict(N=prof.z.attrs.get("N"), nz=z.size, dz_first=z[1] - z[0],
+               dz_mean_bl=float(np.mean(np.diff(z[z <= zi]))) if (z <= zi).sum() > 1 else np.nan,
+               points_in_bl=int(((z > 0) & (z <= zi)).sum()),
+               points_in_surface_layer=int(((z > 0) & (z <= 0.1 * zi)).sum()))
+    if fld is not None:
+        Lx, Ly = float(np.ptp(fld.x.values)), float(np.ptp(fld.y.values))
+        res.update(Lx=Lx, Ly=Ly, dx_mean=Lx / (fld.x.size - 1), dy_mean=Ly / (fld.y.size - 1),
+                   Lx_over_zi=Lx / zi)
+    if "tke_res_frac" in prof:
+        res["min_resolved_tke_frac_bl"] = float(prof.tke_res_frac.where(
+            (prof.z > 0) & (prof.z < zi)).min())
+    if verbose:
+        print("---- resolution -------------------------------------------")
+        for k, v in res.items():
+            print(f" {k:<26}: {v:.4g}" if isinstance(v, float) else f" {k:<26}: {v}")
+        if "min_resolved_tke_frac_bl" in res and res["min_resolved_tke_frac_bl"] < 0.8:
+            print(" ! resolved TKE < 80 % somewhere in the BL (Pope's criterion)")
+        print("-----------------------------------------------------------")
+    return res
+
+
+# ----------------------------------------------------------------------------
+# Time step
+# ----------------------------------------------------------------------------
+def _inv_spacing(c, N):
+    """1/local spacing as in Neko's CFL (centred inside an element, one-sided
+    at the element ends; the largest value is kept at shared nodes)."""
+    inv = np.zeros(c.size)
+    if N is None:
+        return 1.0 / np.gradient(c)
+    for e in range((c.size - 1) // N):
+        x = c[e * N:(e + 1) * N + 1]
+        d = np.empty(N + 1)
+        d[0], d[-1] = x[1] - x[0], x[-1] - x[-2]
+        d[1:-1] = 0.5 * (x[2:] - x[:-2])
+        sl = slice(e * N, (e + 1) * N + 1)
+        inv[sl] = np.maximum(inv[sl], 1.0 / d)
+    return inv
+
+
+def cfl_dt(fld, cfl=0.5):
+    """Largest time step giving `cfl` for a field snapshot, with Neko's CFL
+    definition: dt * max(|u|/dx + |v|/dy + |w|/dz), dx = local GLL spacing."""
+    snap = fld.isel(time=-1) if "time" in fld.dims else fld
+    N = snap.x.attrs.get("N")
+    ix, iy, iz = (xr.DataArray(_inv_spacing(snap[d].values, N), dims=d) for d in ("x", "y", "z"))
+    c = abs(snap.u) * ix + abs(snap.v) * iy + abs(snap.w) * iz
+    return float(cfl / c.max())
