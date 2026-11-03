@@ -455,3 +455,121 @@ def plot_profiles(prof, variables, zi=None, zmax=None, labels=None, axs=None, ev
     if title is not False and (title or created):
         ps.average_title(fig, data, evo, title)
     return fig, (axs[0] if len(axs) == 1 else axs)
+
+
+def plot_fluxes(prof, fluxes=("uw", "vw", "wt"), zi=None, zmax=None, labels=None, axs=None,
+                evolution=None, title=None):
+    """Total (solid), resolved (dashed) and SGS (dotted) fluxes; one panel
+    per flux, one colour per simulation. evolution: see plot_profiles (thin
+    lines of the total flux, or of the resolved one if there is no total);
+    title: see plot_profiles."""
+    fluxes = [fluxes] if isinstance(fluxes, str) else list(fluxes)
+    data = ps.as_dict(prof, labels)
+    evo = _evolution(data, evolution)
+    created = axs is None
+    fig, axs = _new_or_given(axs, len(fluxes))
+    axs = np.atleast_1d(axs)
+    for i, (lab, ds) in enumerate(data.items()):
+        z = ps.zcoord(ds, zi)
+        for ax, f in zip(axs, fluxes):
+            if evo is not None:
+                name = f + "_tot" if f + "_tot" in evo else f
+                ps.evolution_lines(ax, evo, name, _evo_z(ds, zi))
+            for comp, name in (("total", f + "_tot"), ("res", f), ("sgs", f + "_sgs")):
+                if name in ds:
+                    ax.plot(ds[name], z, color=ps.mean_color(i, evo), ls=ps.ls(comp), lw=ps.mean_lw(evo))
+    for ax, f in zip(axs, fluxes):
+        ax.axvline(0, color="0.6", lw=0.6)
+        ax.set_xlabel(ps.label(f))
+        ps.zlabel(ax, zi)
+    ps.component_legend(axs[0], loc="upper left")
+    if len(data) > 1:
+        ps.run_legend(axs[-1], list(data), loc="upper right")
+    if zmax is not None:
+        axs[0].set_ylim(0, zmax)
+    ps.evolution_colorbar(fig, axs, evo)
+    if title is not False and (title or created):
+        ps.average_title(fig, data, evo, title)
+    return fig, (axs[0] if len(axs) == 1 else axs)
+
+
+def plot_time_height(hist, var, zi=None, zmax=None, cmap=None, symmetric=None, labels=None, ax=None):
+    """Time-height plot of a (time, z) variable.
+
+    hist      : derived (time, z) Dataset, or a dict / list of them (one panel
+                each, shared colour scale).
+    zi        : optional DataArray zi(time) (or dict of them) drawn on top.
+    symmetric : diverging colour map centred at 0 (default: if the data change sign).
+    """
+    data = ps.as_dict(hist, labels)
+    zis = zi if isinstance(zi, dict) else {k: zi for k in data}
+    if ax is None:
+        fig, axs = ps.subplots(len(data), 1, kind="wide", sharex=False, sharey=True,
+                               figsize=(ps.STYLE["wide_width"], ps.STYLE["wide_height"] * len(data)))
+    else:
+        fig, axs = ax.figure, ax
+    axs = np.atleast_1d(axs)
+    allv = np.concatenate([d[var].values.ravel() for d in data.values()])
+    if symmetric is None:
+        symmetric = np.nanmin(allv) < 0 < np.nanmax(allv)
+    if symmetric:
+        vmin, vmax = ps.symmetric_limits(allv)
+        kw = dict(vmin=vmin, vmax=vmax, cmap=cmap or ps.STYLE["cmap_div"])
+    else:
+        kw = dict(vmin=np.nanmin(allv), vmax=np.nanmax(allv), cmap=cmap or ps.STYLE["cmap"])
+    for a, (lab, d) in zip(axs, data.items()):
+        pc = a.pcolormesh(d.time, d.z, d[var].transpose("z", "time"), shading="nearest", **kw)
+        z_i = zis.get(lab)
+        if z_i is not None:
+            a.plot(z_i.time, z_i, "w-", lw=1.2)
+            a.plot(z_i.time, z_i, "k--", lw=0.8)
+        a.set_ylabel(ps.label("z"))
+        a.grid(False)
+        if len(data) > 1:
+            a.set_title(lab)
+        if zmax:
+            a.set_ylim(0, zmax)
+    axs[-1].set_xlabel(ps.label("time"))
+    fig.colorbar(pc, ax=list(axs), label=ps.label(var))
+    return fig, (axs[0] if len(axs) == 1 else axs)
+
+
+def plot_hodograph(prof, zmax=None, labels=None, ax=None, evolution=None, title=None):
+    """Hodograph V(U): coloured by height for one simulation, one colour per
+    simulation when several are given. evolution: hodograph of every window,
+    coloured by time (the mean is then black, with a few heights marked);
+    title: see plot_profiles."""
+    data = ps.as_dict(prof, labels)
+    evo = _evolution(data, evolution)
+    created = ax is None
+    fig, ax = ps.get_ax(ax, "square")
+    for i, (lab, ds) in enumerate(data.items()):
+        p = ds if zmax is None else ds.where(ds.z <= zmax, drop=True)
+        if evo is not None:
+            e = evo if zmax is None else evo.where(evo.z <= zmax, drop=True)
+            ps.evolution_lines(ax, e, lambda d: d.U, lambda d: d.V)
+            ax.plot(p.U, p.V, "o-", ms=2.5, color=ps.mean_color(i, evo), lw=ps.mean_lw(evo), zorder=3)
+            zi_ = ds.attrs.get("zi")        # mark 0.1, 0.5 and 1 zi (or three heights)
+            marks = [f * zi_ for f in (0.1, 0.5, 1.0)] if zi_ else \
+                list(np.linspace(float(p.z[0]), float(p.z[-1]), 5)[1:-1])
+            for zm in marks:
+                j = int(np.argmin(np.abs(p.z.values - zm)))
+                txt = f"{float(p.z[j]):.0f} m" + (f" ({zm / zi_:.1g} $z_i$)" if zi_ else "")
+                ax.plot(float(p.U[j]), float(p.V[j]), "o", ms=5, mfc="w", mec="k", zorder=4)
+                ax.annotate(txt, (float(p.U[j]), float(p.V[j])), fontsize=7, xytext=(7, -3),
+                            textcoords="offset points", ha="left", va="top", color="0.1", zorder=5,
+                            bbox=dict(boxstyle="round,pad=0.15", fc="w", ec="none", alpha=0.8))
+        elif len(data) == 1:
+            ax.plot(p.U, p.V, color="0.5", lw=0.8)
+            sc = ax.scatter(p.U, p.V, c=p.z, s=14, cmap=ps.STYLE["cmap"], zorder=3)
+            fig.colorbar(sc, ax=ax, label=ps.label("z"))
+        else:
+            ax.plot(p.U, p.V, "o-", ms=3, color=ps.color(i), label=lab)
+    if len(data) > 1:
+        ax.legend()
+    ax.set_xlabel(ps.label("U"))
+    ax.set_ylabel(ps.label("V"))
+    ps.evolution_colorbar(fig, ax, evo)
+    if title is not False and (title or created):
+        ps.average_title(fig, data, evo, title)
+    return fig, ax
