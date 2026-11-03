@@ -573,3 +573,125 @@ def plot_hodograph(prof, zmax=None, labels=None, ax=None, evolution=None, title=
     if title is not False and (title or created):
         ps.average_title(fig, data, evo, title)
     return fig, ax
+
+# ----------------------------------------------------------------------------
+# Overview figures: every profile of a group in one figure
+# ----------------------------------------------------------------------------
+OVERVIEW = {
+    "momentum": ["U", "V", "M", "wdir", "S", "uw", "vw", "tau", "uu", "vv", "ww", "tke",
+                 "uv", "Su", "Sw", "nut", "Q_cross", "Q_along"],
+    "heat": ["{S}", "d{S}dz", "N2", "w{s}", "u{s}", "v{s}", "{s}{s}", "S{s}", "w{s}{s}", "ww{s}",
+             "alpha_{s}", "Pr_sgs"],
+    "scalar": ["{S}", "d{S}dz", "w{s}", "u{s}", "v{s}", "{s}{s}", "S{s}", "w{s}{s}", "alpha_{s}"],
+    "stability": ["Ri_g", "Ri_b", "Ri_f", "N2", "S"],
+}
+_RI = ("Ri_g", "Ri_b", "Ri_f")
+
+
+def _components(ds, var):
+    """{component: DataArray} of a variable: total / resolved / SGS when split."""
+    if var == "tke":
+        if "tke_sgs" in ds:
+            return {"total": ds.tke + ds.tke_sgs, "res": ds.tke, "sgs": ds.tke_sgs}
+        return {"res": ds.tke} if "tke" in ds else {}
+    if var == "tau":
+        return {c: ds[n] for c, n in (("total", "tau"), ("res", "tau_res"), ("sgs", "tau_sgs")) if n in ds}
+    if var + "_sgs" in ds:
+        comps = {"res": ds[var]} if var in ds else {}
+        comps["sgs"] = ds[var + "_sgs"]
+        if var + "_tot" in ds:
+            comps["total"] = ds[var + "_tot"]
+        return comps
+    return {"total": ds[var]} if var in ds else {}
+
+
+def plot_overview(prof, group="momentum", sym=None, zi=None, zmax=None, labels=None, ncols=6,
+                  evolution=None, title=None):
+    """All the profiles of a group in one figure (shared z axis):
+
+    'momentum'  U V M wdir S, <u'w'> <v'w'> |tau> (total / resolved / SGS),
+                variances, TKE (resolved / SGS / total), <u'v'>, skewness,
+                <nu_t>, cumulative cross- and along-isobaric transport Q
+    'heat'      Theta, dTheta/dz, N2, heat fluxes (total / res / SGS), <theta'^2>,
+                skewness, third moments, <alpha_t>, <nu_t>/<alpha_t>
+    'scalar'    the same for another scalar `sym` (e.g. 'c')
+    'stability' Ri_g, Ri_b (bulk, from the lowest point), Ri_f, N2, S
+                (Ri axes clipped to [-1, 2]; 0.25 marked)
+    Panels without data in any run are left out. Colour = simulation, line
+    style = component. evolution: (time, z) profiles drawn as thin lines
+    behind the mean (one simulation only; total component, else the first
+    one; coloured by time, see plot_profiles). title: see plot_profiles.
+    Returns fig, axs."""
+    data = ps.as_dict(prof, labels)
+    evo = _evolution(data, evolution)
+    first = next(iter(data.values()))
+    sym = sym or (first.attrs.get("sym", "t") if group == "heat" else None)
+    if group == "scalar" and sym is None:
+        extra = [c for c in first.attrs.get("scalars", "")[1:]]
+        if not extra:
+            raise ValueError("no scalar other than the temperature in the statistics")
+        sym = extra[0]
+    names = [n.format(s=sym or "t", S=(sym or "t").upper()) for n in OVERVIEW[group]]
+    names = [n for n in names if any(_components(d, n) for d in data.values())]
+    if not names:
+        raise ValueError(f"no data for the '{group}' overview")
+    nc = min(ncols, len(names))
+    nr = int(np.ceil(len(names) / nc))
+    fig, axs = ps.subplots(nr, nc, kind="profile", sharey=True,
+                           figsize=(0.9 * ps.STYLE["panel_width"] * nc, 0.85 * ps.STYLE["panel_height"] * nr))
+    axs = np.atleast_1d(axs).ravel()
+    created = True
+    split = False
+    for ax, var in zip(axs, names):
+        lo, hi, vmin, vmax = [], [], [], []
+        for i, (lab, ds) in enumerate(data.items()):
+            zc = ps.zcoord(ds, zi)
+            if evo is not None and _components(evo.isel(time=0), var):
+                def first(d, var=var):
+                    c = _components(d, var)
+                    return c.get("total", next(iter(c.values())))
+                ev = ps.evolution_lines(ax, evo, first, _evo_z(ds, zi))
+                ezc = np.asarray(_evo_z(ds, zi)(evo))
+                for v in ev:
+                    v = v[(ezc <= zmax) & np.isfinite(v)] if zmax else v[np.isfinite(v)]
+                    if v.size:      # robust: a single noisy window must not set the range
+                        lo.append(np.percentile(v, 2))
+                        hi.append(np.percentile(v, 98))
+                        vmin.append(np.percentile(v, 1))
+                        vmax.append(np.percentile(v, 99))
+            for comp, da in _components(ds, var).items():
+                ax.plot(da, zc, color=ps.mean_color(i, evo), ls=ps.ls(comp), label=lab, lw=ps.mean_lw(evo))
+                split |= comp != "total"
+                v = da.where(zc <= zmax).values if zmax else da.values
+                v = v[np.isfinite(v)]
+                if v.size:
+                    lo.append(np.percentile(v, 2))
+                    hi.append(np.percentile(v, 98))
+                    vmin.append(v.min())
+                    vmax.append(v.max())
+        if var in _RI:
+            ax.axvline(0.25, color="0.5", ls=ps.ls("ref"), lw=0.8)
+            if lo:
+                ax.set_xlim(max(min(lo), -1.0) - 0.05, min(max(hi), 2.0) + 0.05)
+        elif vmin and zmax is not None:      # x range of what is visible below zmax
+            a, b = min(vmin), max(vmax)
+            pad = 0.05 * (b - a) if b > a else 0.05 * abs(a) + 1e-12
+            ax.set_xlim(a - pad, b + pad)
+        ax.xaxis.get_offset_text().set_fontsize(ps.STYLE["tick_size"] - 2)
+        if lo and min(lo) < 0 < max(hi):
+            ax.axvline(0, color="0.6", lw=0.6)
+        ax.set_xlabel(ps.label(var))
+        ps.zlabel(ax, zi)
+        ax.xaxis.set_major_locator(plt.MaxNLocator(4))
+    for ax in axs[len(names):]:
+        ax.set_visible(False)
+    if zmax is not None:
+        axs[0].set_ylim(0, zmax)
+    if split:
+        ps.component_legend(axs[0], loc="upper left")
+    if len(data) > 1:
+        ps.run_legend(axs[len(names) - 1], list(data), loc="upper right")
+    ps.evolution_colorbar(fig, axs[:len(names)], evo)
+    if title is not False and (title or created):
+        ps.average_title(fig, data, evo, title)
+    return fig, axs[:len(names)]
