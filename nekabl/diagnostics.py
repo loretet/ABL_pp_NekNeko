@@ -662,3 +662,88 @@ def plot_ekman(ts, labels=None, axs=None):
         ps.run_legend(axs[1], list(data), loc="best")
     axs[-1].set_xlabel(ps.label("time"))
     return fig, axs
+
+# ----------------------------------------------------------------------------
+# Surface heat flux and temperature: LES vs wall model
+# ----------------------------------------------------------------------------
+def surface_bc(case, t):
+    """Prescribed surface value(s) at time(s) t: ('neumann', q) or ('dirichlet', theta_s);
+    a time-dependent Nek5000 surface temperature (case.surface_temperature_expr) is
+    evaluated. (None, None) if unknown."""
+    t = np.asarray(t, float)
+    expr = getattr(case, "surface_temperature_expr", None)
+    if expr and re.fullmatch(r"[-+*/(). 0-9eE]*time[-+*/(). 0-9eE]*", expr.replace("time", " time ")):
+        return "dirichlet", eval(expr, {"__builtins__": {}}, {"time": t})  # noqa: S307 (checked)
+    bc = getattr(case, "temp_bc_type", None)
+    if bc == "neumann" and case.surface_flux is not None:
+        return bc, np.full(t.shape, float(case.surface_flux))
+    if bc == "dirichlet" and case.surface_temperature is not None:
+        return bc, np.full(t.shape, float(case.surface_temperature))
+    return bc, None
+
+
+def _wm_name(case):
+    wm = str(getattr(case, "wall_model", "") or "").lower()
+    return "richardson" if "richardson" in wm else "most"
+
+
+@_over_time
+def _surface_one(prof, case, model, sym, t):
+    S = sym.upper()
+    hi = case.h_index if case.h_index is not None else 1
+    h = float(case.h) if getattr(case, "h", None) else float(prof.z[hi])
+    Mh = float(sem.interp(prof.M, np.array([h]))[0])
+    Th = float(sem.interp(prof[S], np.array([h]))[0])
+    wt = f"w{sym}_tot" if f"w{sym}_tot" in prof else f"w{sym}"
+    if "time" in prof.coords:
+        tt = float(prof.time)
+    elif "t0" in prof.attrs and "t1" in prof.attrs:      # time-averaged profile: mid-window
+        tt = 0.5 * (prof.attrs["t0"] + prof.attrs["t1"])
+    else:
+        tt = t if t is not None else np.nan
+    bc, val = surface_bc(case, tt)
+    out = dict(h=h, M_h=Mh, T_h=Th, ts_les=_surface(prof, S),
+               q_les=_surface(prof, wt) if wt in prof else np.nan,
+               ustar_les=float(_surface(prof, "tau") ** 0.5) if "tau" in prof else np.nan,
+               bc_value=float(val) if val is not None else np.nan,
+               bc_dirichlet=float(bc == "dirichlet"))
+    g, T0 = prof.attrs.get("g", 9.81), prof.attrs.get("T0", 300.0)
+    out["L_les"] = float(most.obukhov_length(out["ustar_les"], out["q_les"], T0, g, case.kappa or 0.4))
+    if val is not None and np.isfinite(val) and case.z0:
+        g = prof.attrs.get("g", 9.81)
+        wm = most.neko_wall_model(Mh, Th, h, case.z0, case.z0h, case.kappa or 0.4,
+                                  case.Pr or 1.0, g, bc, float(val), model)
+        out.update({f"{k}_wm": float(v) for k, v in wm.items()})
+    return out
+
+
+def surface_check(prof, case, model=None, sym="t"):
+    """Surface heat flux, surface temperature and u*: what the LES has versus what
+    the wall model gives for the MEAN wind and temperature at the sampling height h.
+
+    prof  : derived profile (z) or history (time, z) (Run.profile / Run.history).
+    model : 'most' or 'richardson' (default from case.wall_model).
+    Returns a dict / Dataset(time) with
+      q_les      total (resolved + SGS) heat flux at the wall node
+      ts_les     temperature at the wall node (what the simulation has at the surface)
+      ustar_les  sqrt of the total stress at the wall node
+      bc_value   prescribed surface flux (Neumann) or temperature (Dirichlet)
+      q_wm, ts_wm, ustar_wm, L_wm, Ri_b_wm   most.neko_wall_model on the mean M(h), T(h):
+                 Dirichlet -> q_wm is the flux the model imposes for the mean state;
+                 Neumann   -> ts_wm is the surface temperature implied by its heat law.
+      M_h, T_h, h
+    The model works node by node on instantaneous values, so the mean-state values
+    differ from the averaged model output (Jensen); the log (Neko) or wmles.dat
+    (Nek5000) give the latter, see Run.wall_model_series and plot_surface."""
+    model = model or _wm_name(case)
+    return _surface_one(prof, case, model, sym, None)
+
+
+def plot_surface(chk, series=None, labels=None, window=600.0, axs=None):
+    """Surface heat flux, surface temperature, u* and L versus time.
+    chk    : surface_check of a history (dict / list for several runs).
+    series : optional per-step wall-model output (Run.wall_model_series), same keys.
+    Styles: LES statistics = solid with markers, wall model on the mean state = dashed,
+    wall-model output every step = thin dash-dot (running mean over `window` s),
+    prescribed value = grey."""
+    raise NotImplementedError
