@@ -746,4 +746,63 @@ def plot_surface(chk, series=None, labels=None, window=600.0, axs=None):
     Styles: LES statistics = solid with markers, wall model on the mean state = dashed,
     wall-model output every step = thin dash-dot (running mean over `window` s),
     prescribed value = grey."""
-    raise NotImplementedError
+    data = ps.as_dict(chk, labels)
+    ser = series if isinstance(series, dict) else ({k: series for k in data} if series is not None else {})
+    panels = [("q", r"surface heat flux (K m s$^{-1}$)"), ("ts", r"surface $\theta_s$ (K)"),
+              ("ustar", ps.label("ustar")), ("L", ps.label("L"))]
+    if axs is None:
+        fig, axs = ps.subplots(len(panels), 1, kind="wide", sharex=True, sharey=False,
+                               figsize=(ps.STYLE["wide_width"], 1.5 * len(panels) + 0.7))
+    else:
+        fig = np.ravel(axs)[0].figure
+    axs = np.atleast_1d(axs)
+    for i, (lab, d) in enumerate(data.items()):
+        c = ps.color(i)
+        t = d.time
+        dirichlet = bool(np.nanmax(np.atleast_1d(d.get("bc_dirichlet", 0.0))))
+        fixed = "ts" if dirichlet else "q"          # the prescribed quantity
+        for ax, (k, _) in zip(axs, panels):
+            if f"{k}_les" in d:
+                ax.plot(t, d[f"{k}_les"], marker="o", ms=3, color=c, ls=ps.ls("total"))
+            if f"{k}_wm" in d and k != fixed:
+                ax.plot(t, d[f"{k}_wm"], marker="s", ms=3, color=c, ls=ps.ls("ref"), mfc="none")
+        if "bc_value" in d and np.isfinite(d.bc_value).any():
+            axs[1 if dirichlet else 0].plot(t, d.bc_value, color="0.5", lw=2, alpha=0.6, zorder=1)
+        if "T_h" in d:
+            axs[1].plot(t, d.T_h, color=c, ls=ps.ls("sgs"), lw=1)
+        s = ser.get(lab)
+        if s is not None and len(s):
+            tt = np.asarray(s["t"], float)
+            n = int(max(1, min(window / max(np.median(np.diff(tt)), 1e-9), tt.size // 4)))
+            for ax, (k, _) in zip(axs, panels):
+                if k in s:
+                    y = np.asarray(s[k], float)
+                    if k == "L":
+                        y = np.where(np.abs(y) > 1e5, np.nan, y)
+                    ym = (np.convolve(np.nan_to_num(y), np.ones(n) / n, mode="same") if n > 1 else y)
+                    sl = slice(n, -n if n > 1 else None)
+                    ax.plot(tt[sl], ym[sl], color=c, ls=ps.ls("model"), lw=1.0)
+    for ax, (k, yl) in zip(axs, panels):
+        ax.set_ylabel(yl)
+    Ls = np.concatenate([np.asarray(dd.L_les.where(dd.time > dd.time[0] + 0.2 * (dd.time[-1] - dd.time[0])))
+                         for dd in data.values() if "L_les" in dd and "time" in dd.dims])
+    Ls = Ls[np.isfinite(Ls)]
+    Lall = np.concatenate([np.asarray(dd.L_les) for dd in data.values() if "L_les" in dd])
+    Lall = Lall[np.isfinite(Lall)]
+    if Ls.size:       # the (near-)neutral start would hide the rest: clip only if it is far out
+        lo, hi = np.percentile(Ls, [2, 98])
+        pad = 0.5 * (hi - lo) + 1.0
+        if Lall.min() < lo - 2 * pad or Lall.max() > hi + 2 * pad:
+            axs[3].set_ylim(min(lo - pad, 0) if lo < 0 else max(lo - pad, 0), hi + pad if hi > 0 else 0)
+    from matplotlib.lines import Line2D
+    h = [Line2D([], [], color="0.3", marker="o", ms=3, ls=ps.ls("total"), label="LES (statistics)"),
+         Line2D([], [], color="0.3", marker="s", ms=3, mfc="none", ls=ps.ls("ref"),
+                label="wall model, mean state"),
+         Line2D([], [], color="0.3", ls=ps.ls("model"), label="wall model output"),
+         Line2D([], [], color="0.5", lw=2, alpha=0.6, label="prescribed"),
+         Line2D([], [], color="0.3", ls=ps.ls("sgs"), label=r"$\theta(h)$")]
+    axs[0].legend(handles=h, loc="best", ncol=2)
+    if len(data) > 1:
+        ps.run_legend(axs[-1], list(data), loc="best")
+    axs[-1].set_xlabel(ps.label("time"))
+    return fig, axs
