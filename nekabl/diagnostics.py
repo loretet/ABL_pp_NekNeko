@@ -491,3 +491,174 @@ def cfl_dt(fld, cfl=0.5):
     ix, iy, iz = (xr.DataArray(_inv_spacing(snap[d].values, N), dims=d) for d in ("x", "y", "z"))
     c = abs(snap.u) * ix + abs(snap.v) * iy + abs(snap.w) * iz
     return float(cfl / c.max())
+
+
+def plot_timestep(steps, iterations=True, labels=None, axs=None):
+    """dt, CFL (and Krylov iterations) versus simulated time, from read_log.
+    `steps` can be a dict / list of logs (one colour per simulation; the
+    iterations panel then shows the pressure solver only)."""
+    data = ps.as_dict(steps, labels)
+    first = next(iter(data.values()))
+    its = [c for c in first.columns if c.startswith("it_")] if iterations else []
+    if len(data) > 1:
+        its = [c for c in its if "Pres" in c][:1]
+    keys = [k for k in ("dt", "cfl") if k in first] + (["its"] if its else [])
+    if axs is None:
+        fig, axs = ps.subplots(len(keys), 1, kind="wide", sharex=True, sharey=False,
+                               figsize=(ps.STYLE["wide_width"], 1.5 * len(keys) + 0.5))
+    else:
+        fig = np.ravel(axs)[0].figure
+    axs = np.atleast_1d(axs)
+    for i, (lab, st) in enumerate(data.items()):
+        for ax, k in zip(axs, keys):
+            if k == "its":
+                for j, c in enumerate(its):
+                    if c in st:
+                        col = ps.color(j) if len(data) == 1 else ps.color(i)
+                        ax.plot(st.t, st[c], lw=0.8, color=col, label=c[3:] if len(data) == 1 else lab)
+                ax.set_ylabel("iterations")
+            elif k in st:
+                ax.plot(st.t, st[k], lw=0.8, color="k" if len(data) == 1 else ps.color(i), label=lab)
+                ax.set_ylabel(r"$\Delta t$ (s)" if k == "dt" else "CFL")
+    if its:
+        axs[-1].legend(ncol=min(4, max(len(its), len(data))))
+    if len(data) > 1:
+        axs[0].legend()
+    axs[-1].set_xlabel(ps.label("time"))
+    return fig, (axs[0] if len(axs) == 1 else axs)
+
+def plot_step_series(series, window=600.0, labels=None, axs=None):
+    """Per-step series written by the case (Run.step_series: u* from the wall torque,
+    dt, CFL, wall-model heat flux and Obukhov length) versus time, as running
+    means over `window` seconds (thin line = raw, thick = mean)."""
+    data = ps.as_dict({k: v for k, v in (series.items() if isinstance(series, dict) else
+                                         enumerate(series)) if v is not None}, labels)
+    keys = [k for k in ("ustar", "wm_q", "wm_L", "dt", "cfl") if any(k in s for s in data.values())]
+    if axs is None:
+        fig, axs = ps.subplots(len(keys), 1, kind="wide", sharex=True, sharey=False,
+                               figsize=(ps.STYLE["wide_width"], 1.4 * len(keys) + 0.6))
+    else:
+        fig = np.ravel(axs)[0].figure
+    axs = np.atleast_1d(axs)
+    ylab = {"ustar": r"$u_*$ torque (m s$^{-1}$)", "wm_q": r"wall model $q$ (K m s$^{-1}$)",
+            "wm_L": r"wall model $L$ (m)", "dt": r"$\Delta t$ (s)", "cfl": "CFL"}
+    for i, (lab, s) in enumerate(data.items()):
+        t = s.time.values
+        dt_mean = max(np.median(np.diff(t)), 1e-9)
+        n = int(max(1, min(window / dt_mean, t.size // 4)))
+        for ax, k in zip(axs, keys):
+            if k not in s:
+                continue
+            y = s[k].values.astype(float)
+            if k == "wm_L":
+                y = np.where(np.abs(y) > 1e5, np.nan, y)
+            c = ps.color(i)
+            ax.plot(t, y, color=c, lw=0.3, alpha=0.35)
+            ym = np.convolve(np.nan_to_num(y), np.ones(n) / n, mode="same") if n > 1 else y
+            ax.plot(t[n:-n], ym[n:-n], color=c, lw=1.4, label=lab)
+            ax.set_ylabel(ylab[k])
+            if k == "wm_L":      # the neutral start (L -> infinity) would hide everything else
+                hi = np.nanpercentile(y[t > 0.1 * t[-1]], 99) if np.isfinite(y).any() else 1.0
+                ax.set_ylim(0, 1.5 * hi)
+            elif k == "dt":
+                ax.set_ylim(0, None)
+    if len(data) > 1:
+        axs[0].legend()
+    axs[-1].set_xlabel(ps.label("time"))
+    return fig, (axs[0] if len(axs) == 1 else axs)
+
+# ----------------------------------------------------------------------------
+# Ekman layer: cross-isobaric mass transport and wind turning
+# ----------------------------------------------------------------------------
+def _wrap(a):
+    return (a + 180.0) % 360.0 - 180.0
+
+
+@_over_time
+def ekman_transport(prof, case=None, zmax=None, rho=1.0):
+    """Integrated mass transport of the boundary layer and wind turning (dict,
+    or Dataset over time for a (time, z) history).
+
+    With G = (Ug, Vg) the geostrophic wind (case.u_geo, else the top wind),
+    a = G/|G| (along the isobars) and c = k x a (across, towards low pressure
+    for f > 0):
+
+    Q_along   rho int_0^zmax (u - u_g) . a dz   (< 0: wind deficit)       kg m-1 s-1
+    Q_cross   rho int_0^zmax (u - u_g) . c dz   (cross-isobaric transport)
+    Q_cross_ekman, Q_along_ekman
+              the same from the surface stress alone (steady, horizontally
+              homogeneous, no stress at zmax):  f k x Q = -tau_s  ->
+              Q = rho (<v'w'>_s, -<u'w'>_s) / f      (total = resolved + SGS stress)
+    alpha_s   turning angle between the wind at the lowest point above the surface
+              and G, degrees, counter-clockwise positive (> 0 in the NH)
+    alpha_zi  same at zi (if prof.attrs['zi'] is known)
+    wdir_s, wdir_g  meteorological directions (deg, where the wind comes from)
+    zmax default: the top of the domain (a sponge layer, if any, is included).
+    """
+    from .profiles import geostrophic_wind
+
+    ug, vg, _ = geostrophic_wind(prof, case)
+    ug, vg = float(ug), float(vg)
+    G = np.hypot(ug, vg)
+    ca, sa = ug / G, vg / G
+    p = prof if zmax is None else prof.where(prof.z <= zmax, 0.0)
+    du, dv = p.U - ug, p.V - vg
+    out = dict(Q_along=rho * float(sem.integrate(du * ca + dv * sa, "z")),
+               Q_cross=rho * float(sem.integrate(-du * sa + dv * ca, "z")))
+    f = getattr(case, "f", None) if case is not None else None
+    uw = "uw_tot" if "uw_tot" in prof else "uw"
+    vw = "vw_tot" if "vw_tot" in prof else "vw"
+    if f and uw in prof and vw in prof:
+        qx, qy = rho * _surface(prof, vw) / f, -rho * _surface(prof, uw) / f
+        out["Q_along_ekman"] = qx * ca + qy * sa
+        out["Q_cross_ekman"] = -qx * sa + qy * ca
+    ang_g = np.degrees(np.arctan2(vg, ug))
+    k = 1 if float(prof.z[0]) <= 0 else 0          # first point above the wall
+    out["alpha_s"] = float(_wrap(np.degrees(np.arctan2(prof.V[k], prof.U[k])) - ang_g))
+    zi = prof.attrs.get("zi")
+    if zi and np.isfinite(zi):
+        Ui, Vi = (float(sem.interp(prof[c], np.array([zi]))[0]) for c in ("U", "V"))
+        out["alpha_zi"] = float(_wrap(np.degrees(np.arctan2(Vi, Ui)) - ang_g))
+    out["wdir_s"] = float((270.0 - np.degrees(np.arctan2(prof.V[k], prof.U[k]))) % 360.0)
+    out["wdir_g"] = float((270.0 - ang_g) % 360.0)
+    return out
+
+
+def plot_ekman(ts, labels=None, axs=None):
+    """Time series of the cross-isobaric transport (LES: solid, from the surface
+    stress via the Ekman balance: dashed) and of the surface turning angle.
+    `ts` from ekman_transport(history) or Run.timeseries(); dict / list for
+    several runs."""
+    data = ps.as_dict(ts, labels)
+    if axs is None:
+        fig, axs = ps.subplots(3, 1, kind="wide", sharex=True, sharey=False,
+                               figsize=(ps.STYLE["wide_width"], 5.0))
+    else:
+        fig = np.ravel(axs)[0].figure
+    axs = np.atleast_1d(axs)
+    for i, (lab, d) in enumerate(data.items()):
+        c = ps.color(i)
+        for ax, v in zip(axs[:2], ("Q_cross", "Q_along")):
+            if v in d:
+                ax.plot(d.time, d[v], marker="o", ms=3, color=c, ls=ps.ls("total"), label=lab)
+            if v + "_ekman" in d:
+                ax.plot(d.time, d[v + "_ekman"], color=c, ls=ps.ls("ref"))
+        for v, st in (("alpha_s", "total"), ("alpha_zi", "res")):
+            if v in d:
+                axs[2].plot(d.time, d[v], marker="o", ms=3, color=c, ls=ps.ls(st))
+    short = {"Q_cross": r"$Q_\perp$ (m$^2$ s$^{-1}$)", "Q_along": r"$Q_\parallel$ (m$^2$ s$^{-1}$)",
+             "alpha": r"turning ($^\circ$)"}
+    for ax, v in zip(axs, ("Q_cross", "Q_along", "alpha")):
+        ax.set_ylabel(short[v])
+        ax.axhline(0, color="0.6", lw=0.6)
+    from matplotlib.lines import Line2D
+    axs[0].legend(handles=[Line2D([], [], color="0.3", ls=ps.ls("total"), label="LES, cross-isobaric"),
+                           Line2D([], [], color="0.3", ls=ps.ls("ref"), label=r"$-\tau_s/f$ (Ekman)")],
+                  loc="best")
+    axs[1].set_title("along-isobaric (deficit)", fontsize=ps.STYLE["legend_size"], loc="left")
+    axs[2].legend(handles=[Line2D([], [], color="0.3", ls=ps.ls("total"), label="surface"),
+                           Line2D([], [], color="0.3", ls=ps.ls("res"), label=r"$z_i$")], loc="best")
+    if len(data) > 1:
+        ps.run_legend(axs[1], list(data), loc="best")
+    axs[-1].set_xlabel(ps.label("time"))
+    return fig, axs
