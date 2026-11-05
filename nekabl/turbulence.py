@@ -521,3 +521,140 @@ def autocorrelation(fld, var, z, direction="x"):
     ry = ry - ry[a.y.size // 2]
     return xr.DataArray(R, dims=["z", "ry", "rx"], coords={"z": a.z.values, "ry": ry, "rx": rx},
                         attrs=dict(var=var, direction="2d", **_meta(fld)))
+
+
+def integral_length(R):
+    """Integral length scale: integral of R(r) up to its first zero crossing."""
+    out = []
+    for z in R.z.values:
+        r, c = R.r.values, R.sel(z=z).values
+        neg = np.where(c <= 0)[0]
+        if neg.size:   # integrate up to the (linearly interpolated) zero crossing
+            m = neg[0]
+            r0 = r[m - 1] + c[m - 1] * (r[m] - r[m - 1]) / (c[m - 1] - c[m])
+            r, c = np.append(r[:m], r0), np.append(c[:m], 0.0)
+        out.append(float(np.sum(0.5 * (c[1:] + c[:-1]) * np.diff(r))))
+    return xr.DataArray(out, dims="z", coords={"z": R.z.values}, name="L_int")
+
+
+def plot_autocorrelation(R, zi=None, labels=None, ax=None):
+    """R(r) curves (1D; dict / list for several simulations: colour =
+    simulation, line style = height) or a contour map of the 2D
+    autocorrelation at the first height in R."""
+    data = ps.as_dict(R, labels)
+    R = next(iter(data.values()))
+    if "rx" in R.dims:
+        fig, ax = ps.get_ax(ax, "slice")
+        Rz = R.isel(z=0)
+        sc = zi or 1.0
+        cs = ax.contourf(R.rx / sc, R.ry / sc, Rz, levels=np.linspace(-1, 1, 21),
+                         cmap=ps.STYLE["cmap_div"])
+        ax.contour(R.rx / sc, R.ry / sc, Rz, levels=[0.2, 0.5], colors="k", linewidths=0.6)
+        fig.colorbar(cs, ax=ax, label=f"$R_{{{R.attrs['var']}{R.attrs['var']}}}$")
+        ax.set_aspect("equal")
+        unit = r"/z_i$" if zi else r"$ (m)"
+        ax.set_xlabel(r"$r_x" + unit)
+        ax.set_ylabel(r"$r_y" + unit)
+        ax.set_title(f"z = {float(R.z[0]):.0f} m")
+        ax.grid(False)
+        return fig, ax
+    fig, ax = ps.get_ax(ax, "square")
+    for i, (lab, Rr) in enumerate(data.items()):
+        zz = Rr.attrs.get("zi", 1.0) if zi is True else zi
+        for j, z in enumerate(Rr.z.values):
+            c, style = ps.run_height_style(i, j, len(data))
+            r = Rr.r / zz if zz else Rr.r
+            ax.plot(r, Rr.sel(z=z), color=c, ls=style, label=_curve_label(lab, z, len(data)))
+    ax.axhline(0, color="0.6", lw=0.6)
+    ax.set_xlabel(r"$r/z_i$" if zi else r"$r$ (m)")
+    ax.set_ylabel(f"$R_{{{R.attrs['var']}{R.attrs['var']}}}$ ({R.attrs['direction']})")
+    ps.curves_legend(ax, data, loc_heights="lower left")
+    return fig, ax
+
+
+# ----------------------------------------------------------------------------
+# Quadrants and PDFs
+# ----------------------------------------------------------------------------
+def quadrant_analysis(fld, a="w", b="t", z=100.0):
+    """Quadrant decomposition of the flux <a'b'> at heights z.
+
+    Q1: a'>0, b'>0   Q2: a'<0, b'>0   Q3: a'<0, b'<0   Q4: a'>0, b'<0
+    For w-theta in a CBL: Q1 = warm updrafts, Q3 = cold downdrafts (both
+    positive flux); Q2, Q4 = counter-gradient contributions.
+    Returns Dataset (z, quadrant): flux_fraction (sums to 1), area_fraction.
+    """
+    A, B = planes(fld, a, z), planes(fld, b, z)
+    prod = A * B
+    masks = [(A > 0) & (B > 0), (A < 0) & (B > 0), (A < 0) & (B < 0), (A > 0) & (B < 0)]
+    hd = [d for d in A.dims if d != "z"]
+    tot = prod.mean(hd)
+    flux = xr.concat([(prod.where(m, 0)).mean(hd) / tot for m in masks], "quadrant")
+    area = xr.concat([m.mean(hd) for m in masks], "quadrant")
+    q = ["Q1", "Q2", "Q3", "Q4"]
+    return xr.Dataset(dict(flux_fraction=flux, area_fraction=area, flux=tot)).assign_coords(quadrant=q)
+
+
+def _nbins(n, bins):
+    return bins or int(np.clip(np.sqrt(n) / 2, 10, 80))
+
+
+def plot_joint_pdf(fld, a="w", b="t", z=100.0, bins=None, ax=None):
+    """Joint PDF of normalised a', b' at one height, with quadrant flux fractions."""
+    fig, ax = ps.get_ax(ax, "square")
+    A = planes(fld, a, [z]).values.ravel()
+    B = planes(fld, b, [z]).values.ravel()
+    A, B = A / A.std(), B / B.std()
+    H, xe, ye = np.histogram2d(A, B, bins=_nbins(A.size, bins), density=True)
+    with np.errstate(divide="ignore"):
+        logH = np.where(H > 0, np.log10(H), np.nan)
+    pc = ax.pcolormesh(xe, ye, logH.T, cmap=ps.STYLE["cmap"], shading="flat")
+    fig.colorbar(pc, ax=ax, label=r"$\log_{10}$ PDF")
+    ax.axhline(0, color="k", lw=0.6)
+    ax.axvline(0, color="k", lw=0.6)
+    q = quadrant_analysis(fld, a, b, [z]).flux_fraction.isel(z=0).values
+    for (px, py), val, name in zip(((0.97, 0.97), (0.03, 0.97), (0.03, 0.03), (0.97, 0.03)), q,
+                                   ("Q1", "Q2", "Q3", "Q4")):
+        ax.text(px, py, f"{name} {val:+.2f}", transform=ax.transAxes, fontsize=8,
+                ha="right" if px > 0.5 else "left", va="top" if py > 0.5 else "bottom")
+    sym = lambda c: {"t": r"\theta"}.get(c, c)  # noqa: E731
+    ax.set_xlabel(f"${sym(a)}'/\\sigma_{{{sym(a)}}}$")
+    ax.set_ylabel(f"${sym(b)}'/\\sigma_{{{sym(b)}}}$")
+    ax.set_title(f"z = {z:.0f} m")
+    ax.grid(False)
+    return fig, ax
+
+
+def pdf(fld, var, z, bins=None, lim=5.0):
+    """PDF of the normalised fluctuation var'/sigma at heights z.
+    Returns DataArray (z, x) and stores the skewness as attribute per height."""
+    p = planes(fld, var, z)
+    edges = np.linspace(-lim, lim, _nbins(p.isel(z=0).size, bins) + 1)
+    xc = 0.5 * (edges[1:] + edges[:-1])
+    out, skew = [], []
+    for zz in p.z.values:
+        v = p.sel(z=zz).values.ravel()
+        v = v / v.std()
+        out.append(np.histogram(v, bins=edges, density=True)[0])
+        skew.append(float(np.mean(v**3)))
+    return xr.DataArray(np.array(out), dims=["z", "x"], coords={"z": p.z.values, "x": xc},
+                        attrs=dict(var=var, skewness=skew, **_meta(fld)))
+
+
+def plot_pdf(P, labels=None, ax=None):
+    """PDFs (log scale) with the Gaussian for reference; dict / list for
+    several simulations (colour = simulation, line style = height)."""
+    data = ps.as_dict(P, labels)
+    fig, ax = ps.get_ax(ax, "square")
+    for i, (lab, Pp) in enumerate(data.items()):
+        for j, z in enumerate(Pp.z.values):
+            c, style = ps.run_height_style(i, j, len(data))
+            sk = f", S = {Pp.attrs['skewness'][j]:+.2f}" if len(data) == 1 else ""
+            ax.semilogy(Pp.x, Pp.sel(z=z), color=c, ls=style, label=_curve_label(lab, z, len(data)) + sk)
+    x = next(iter(data.values())).x
+    ax.semilogy(x, np.exp(-x**2 / 2) / np.sqrt(2 * np.pi), color="k", ls=ps.ls("ref"), lw=1,
+                label="Gaussian")
+    ax.set_ylim(1e-4, 1)
+    ax.set_xlabel(f"${next(iter(data.values())).attrs['var']}'/\\sigma$")
+    ax.set_ylabel("PDF")
+    ps.curves_legend(ax, data, loc_runs="upper right", loc_heights="upper left")
+    return fig, ax
