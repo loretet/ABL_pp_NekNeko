@@ -360,3 +360,164 @@ def plot_eddy_viscosity(ev, zi=None, zmax=None, labels=None, axs=None, sym="t", 
     if title is not False and (title or created):
         ps.average_title(fig, data, evo, title)
     return fig, axs
+
+
+# ----------------------------------------------------------------------------
+# Planes from field files
+# ----------------------------------------------------------------------------
+def planes(fld, var, z, fluct=True):
+    """Horizontal planes of `var` at heights z on a uniform (periodic) grid.
+
+    Returns a DataArray (..., z, y, x); with fluct=True the plane mean is removed.
+    """
+    p = fields.to_uniform(fields.at_height(fld[var], z))
+    if fluct:
+        p = p - p.mean(("x", "y"))
+    return p
+
+
+def _meta(fld):
+    """label / zi of a field Dataset, carried along to spectra, PDFs, ..."""
+    return {k: fld.attrs[k] for k in ("label", "zi") if k in fld.attrs}
+
+
+def _period(c):
+    """Periodic length of a uniform coordinate without the end point."""
+    return (c[-1] - c[0]) * c.size / (c.size - 1)
+
+
+# ----------------------------------------------------------------------------
+# Spectra
+# ----------------------------------------------------------------------------
+def spectrum(fld, var, z, direction="x", var2=None):
+    """One-sided wavenumber (co)spectrum E(k) at heights z, averaged over the
+    other horizontal direction and over all snapshots.
+
+    direction : 'x', 'y' (1D spectra) or 'radial' (2D spectrum integrated on
+                rings of |k|).
+    var2      : second variable for a cospectrum (e.g. var='w', var2='t').
+    Normalisation: radial -> sum(E * dk) = variance (or covariance) of the
+    plane; 1D -> variance minus the variance of the line means (k = 0 mode
+    of each line, large e.g. for rolls aligned with the direction).
+    Returns DataArray (z, k) with k in rad/m; wavelength = 2 pi / k.
+    """
+    a = planes(fld, var, z)
+    b = planes(fld, var2, z) if var2 else a
+    nx, ny = a.x.size, a.y.size
+    Lx, Ly = _period(a.x.values), _period(a.y.values)
+    tdims = [d for d in a.dims if d not in ("z", "y", "x")]
+    if direction in ("x", "y"):
+        axis = -1 if direction == "x" else -2
+        n, L = (nx, Lx) if direction == "x" else (ny, Ly)
+        Fa = np.fft.rfft(a.values, axis=axis) / n
+        Fb = np.fft.rfft(b.values, axis=axis) / n
+        P = np.real(Fa * np.conj(Fb))
+        P = np.moveaxis(P, axis, -1)
+        P = P.mean(axis=-2)                       # over the other direction
+        dk = 2 * np.pi / L
+        k = np.arange(P.shape[-1]) * dk
+        E = 2 * P / dk
+        if n % 2 == 0:
+            E[..., -1] /= 2                       # Nyquist counted once
+        E, k = E[..., 1:], k[1:]
+    elif direction == "radial":
+        Fa = np.fft.fft2(a.values, axes=(-2, -1)) / (nx * ny)
+        Fb = np.fft.fft2(b.values, axes=(-2, -1)) / (nx * ny)
+        P = np.real(Fa * np.conj(Fb))
+        kx = np.fft.fftfreq(nx, Lx / nx) * 2 * np.pi
+        ky = np.fft.fftfreq(ny, Ly / ny) * 2 * np.pi
+        km = np.hypot(*np.meshgrid(kx, ky))
+        dk = max(2 * np.pi / Lx, 2 * np.pi / Ly)
+        nb = int(min(np.abs(kx).max(), np.abs(ky).max()) / dk)
+        shell = np.rint(km / dk).astype(int)
+        E = np.stack([P[..., shell == i].sum(-1) for i in range(1, nb + 1)], axis=-1) / dk
+        k = np.arange(1, nb + 1) * dk
+    else:
+        raise ValueError("direction must be 'x', 'y' or 'radial'")
+    da = xr.DataArray(E, dims=tdims + ["z", "k"], coords={"z": a.z.values, "k": k})
+    if tdims:
+        da = da.mean(tdims)
+    da.k.attrs["units"] = "rad/m"
+    da.attrs.update(var=var, var2=var2 or var, direction=direction, **_meta(fld))
+    return da
+
+
+def _curve_label(lab, z, n_runs):
+    return f"z = {z:.0f} m" if n_runs == 1 else f"{lab}, z = {z:.0f} m"
+
+
+def plot_spectra(spec, premultiplied=False, zi=None, slope=-5 / 3, labels=None, ax=None):
+    """Spectra, one curve per height. Several simulations (dict / list):
+    colour = simulation, line style = height.
+
+    premultiplied : k E(k) versus wavelength (lambda/zi if zi is given; zi=True
+                    uses each spectrum's attrs['zi']) -- peaks = dominant scales.
+    """
+    data = ps.as_dict(spec, labels)
+    fig, ax = ps.get_ax(ax, "square")
+    n = len(data)
+    for i, (lab, sp) in enumerate(data.items()):
+        zz = sp.attrs.get("zi", 1.0) if zi is True else zi
+        for j, z in enumerate(sp.z.values):
+            s = sp.sel(z=z)
+            c, style = ps.run_height_style(i, j, n)
+            if premultiplied:
+                lam = 2 * np.pi / s.k
+                ax.semilogx(lam / zz if zz else lam, s.k * s, color=c, ls=style,
+                            label=_curve_label(lab, z, n))
+            else:
+                ax.loglog(s.k, np.abs(s), color=c, ls=style, label=_curve_label(lab, z, n))
+    if premultiplied:
+        ax.set_xlabel(r"$\lambda/z_i$" if zi else r"$\lambda$ (m)")
+        ax.set_ylabel(r"$k\,E(k)$")
+    else:
+        first = next(iter(data.values()))
+        if slope is not None:
+            k = first.k.values
+            k0 = k[len(k) // 4:]
+            ref = np.abs(first.isel(z=0)).values[len(k) // 4] * (k0 / k0[0]) ** slope
+            ax.loglog(k0, ref * 2, color="k", ls=ps.ls("ref"), lw=1,
+                      label=r"$k^{-5/3}$" if abs(slope + 5 / 3) < 1e-6 else f"$k^{{{slope:.2f}}}$")
+        ax.xaxis.set_minor_formatter(plt.NullFormatter())
+        ax.set_xlabel(r"$k$ (rad m$^{-1}$)")
+        ax.set_ylabel(r"$E(k)$")
+    ps.curves_legend(ax, data, loc_heights="lower left" if not premultiplied else "upper left")
+    return fig, ax
+
+
+# ----------------------------------------------------------------------------
+# Autocorrelation and integral scales
+# ----------------------------------------------------------------------------
+def autocorrelation(fld, var, z, direction="x"):
+    """Spatial autocorrelation R(r) of the fluctuations at heights z, from FFTs
+    (periodic domain), averaged over lines and snapshots.
+
+    direction : 'x', 'y' -> DataArray (z, r) for r in [0, L/2]
+                '2d'     -> DataArray (z, ry, rx), centred at r = 0
+    """
+    a = planes(fld, var, z)
+    tdims = [d for d in a.dims if d not in ("z", "y", "x")]
+    if direction in ("x", "y"):
+        axis = -1 if direction == "x" else -2
+        c = a.x.values if direction == "x" else a.y.values
+        n = c.size
+        F = np.fft.rfft(a.values, axis=axis)
+        R = np.fft.irfft(np.abs(F) ** 2, n=n, axis=axis)
+        R = np.moveaxis(R, axis, -1).mean(axis=-2)
+        if tdims:
+            R = R.mean(axis=tuple(range(len(tdims))))
+        R = R / R[..., :1]
+        r = (c - c[0])[: n // 2 + 1]
+        return xr.DataArray(R[..., : n // 2 + 1], dims=["z", "r"], coords={"z": a.z.values, "r": r},
+                            attrs=dict(var=var, direction=direction, **_meta(fld)))
+    F = np.fft.fft2(a.values, axes=(-2, -1))
+    R = np.real(np.fft.ifft2(np.abs(F) ** 2, axes=(-2, -1)))
+    if tdims:
+        R = R.mean(axis=tuple(range(len(tdims))))
+    R = np.fft.fftshift(R / R[..., :1, :1], axes=(-2, -1))
+    rx = a.x.values - a.x.values[0]
+    ry = a.y.values - a.y.values[0]
+    rx = rx - rx[a.x.size // 2]
+    ry = ry - ry[a.y.size // 2]
+    return xr.DataArray(R, dims=["z", "ry", "rx"], coords={"z": a.z.values, "ry": ry, "rx": rx},
+                        attrs=dict(var=var, direction="2d", **_meta(fld)))
