@@ -596,3 +596,131 @@ def inversion_height_map(fld, zi, sym="t", method="gradient", window=(0.6, 1.4))
         raise ValueError("method must be 'gradient' or 'isotherm'")
     coords = {d: th[d] for d in dims if d in th.coords}
     return xr.DataArray(h, dims=dims, coords=coords, name="h", attrs={"units": "m", "method": method})
+
+
+def inversion_stats(h, zi=None):
+    """Statistics of the inversion-height map: mean, std, skewness, min, max (and
+    std/zi). The standard deviation of h is the 'corrugation' of the interface;
+    together with the EZ depth it shows how much of the Eulerian EZ is due to
+    the interface moving rather than to local mixing."""
+    v = h.values.ravel()
+    m, s = float(v.mean()), float(v.std())
+    out = dict(h_mean=m, h_std=s, h_skew=float(np.mean(((v - m) / s) ** 3)) if s > 0 else 0.0,
+               h_min=float(v.min()), h_max=float(v.max()))
+    out["h_std_over_h"] = s / (zi or m)
+    return out
+
+
+def _interp_columns(a, z, zq):
+    """a: (nz, ny, nx); zq: (ny, nx) -> linear interpolation of each column."""
+    k = np.clip(np.searchsorted(z, zq), 1, z.size - 1)
+    z0, z1 = z[k - 1], z[k]
+    w = np.clip((zq - z0) / (z1 - z0), 0, 1)
+    v0 = np.take_along_axis(a, (k - 1)[None], 0)[0]
+    v1 = np.take_along_axis(a, k[None], 0)[0]
+    return (1 - w) * v0 + w * v1
+
+
+def interface_composite(fld, h, scalars=None, extent=0.3, n=61):
+    """Conditional means and fluxes in interface-following coordinates s = z - h(x, y).
+
+    For each scalar c (names in the fields; None = all): the mean <c>(s) and
+    the flux <w'c'>(s), with primes taken with respect to the horizontal mean
+    at fixed z.  Compared with the fixed-height (Eulerian) profiles the
+    interface-following ones show the true thickness of the interface and the
+    flux that is carried across it (no smearing by the interface motion).
+
+    extent : half-range of s in units of the mean h;  n : number of points.
+    Returns a Dataset over s with variables mean_c, flux_c and attrs h_mean.
+    """
+    names = field_scalars(fld, scalars)
+    z = fld.z.values
+    hm = float(h.mean())
+    s = np.linspace(-extent, extent, n) * hm
+    time_dim = "time" if "time" in fld.dims else None
+    nt = fld.time.size if time_dim else 1
+    acc = {f"{k}_{c}": np.zeros(n) for c in names for k in ("mean", "flux")}
+    for it in range(nt):
+        f = fld.isel(time=it) if time_dim else fld
+        hh = (h.isel(time=it) if time_dim and "time" in h.dims else h).transpose("y", "x").values
+        w = f["w"].transpose("z", "y", "x").values
+        wp = w - w.mean((1, 2), keepdims=True)
+        for c in names:
+            a = f[c].transpose("z", "y", "x").values
+            ap = a - a.mean((1, 2), keepdims=True)
+            for i, si in enumerate(s):
+                zq = np.clip(hh + si, z[0], z[-1])
+                acc[f"mean_{c}"][i] += _interp_columns(a, z, zq).mean() / nt
+                acc[f"flux_{c}"][i] += (_interp_columns(wp, z, zq) * _interp_columns(ap, z, zq)).mean() / nt
+    out = xr.Dataset({k: ("s", v) for k, v in acc.items()}, coords={"s": s})
+    out["s_over_h"] = ("s", s / hm)
+    out.attrs.update(h_mean=hm, scalars=names, label=fld.attrs.get("label", ""))
+    return out
+
+
+def quadrants_at_inversion(fld, zi, scalars=None, offsets=(-0.1, 0.0, 0.1)):
+    """Quadrant decomposition of w'c' at zi (+ offsets * zi) for each scalar:
+    {name: Dataset(z, quadrant)} with flux_fraction and area_fraction
+    (Q1 w'>0,c'>0; Q2 w'<0,c'>0; Q3 w'<0,c'<0; Q4 w'>0,c'<0). Around the
+    inversion Q2 (entrained warm / scalar-poor air from above carried down)
+    and Q4 (overshooting thermals) dominate the entrainment flux."""
+    from .turbulence import quadrant_analysis
+    z = [zi * (1 + o) for o in offsets]
+    return {c: quadrant_analysis(fld, "w", c, z) for c in field_scalars(fld, scalars)}
+
+
+def plot_inversion_map(h, ax=None, zi=None):
+    """Map of the local inversion height (m), colour scale centred on the mean."""
+    fig, ax = ps.get_ax(ax, "slice")
+    if "time" in h.dims:
+        h = h.isel(time=-1)
+    m = float(h.mean())
+    d = float(np.nanpercentile(abs(h - m), 99)) or 1.0
+    im = ax.pcolormesh(h.x, h.y, h.transpose("y", "x"), cmap=ps.STYLE["cmap_div"], vmin=m - d,
+                       vmax=m + d, shading="auto", rasterized=True)
+    ax.set_aspect("equal")
+    ax.set_xlabel("$x$ (m)")
+    ax.set_ylabel("$y$ (m)")
+    st = inversion_stats(h, zi)
+    ax.set_title(rf"$h$: mean {st['h_mean']:.0f} m, std {st['h_std']:.0f} m" + "\n" + rf"skewness {st['h_skew']:+.2f}",
+                 fontsize=ps.STYLE["title_size"])
+    fig.colorbar(im, ax=ax, label="$h$ (m)")
+    return fig, ax
+
+
+def plot_interface_composite(comps, scalars=None, axs=None, eulerian=None):
+    """Interface-following mean profile and flux of each scalar (one column
+    per scalar; colour = simulation). `comps`: Dataset / dict from
+    `interface_composite`. Top: (<c> - min) / range; bottom: flux / its
+    extreme value (so that all scalars share an axis)."""
+    C = ps.as_dict(comps)
+    first = next(iter(C.values()))
+    names = [n for n in first.attrs["scalars"] if scalars is None or n in
+             (scalars if isinstance(scalars, (list, tuple)) else [scalars])]
+    if axs is None:
+        fig, axs = ps.subplots(2, len(names), kind="square", figsize=(3.0 * len(names), 5.2),
+                               sharey=False)
+        axs = np.asarray(axs).reshape(2, len(names))
+    else:
+        axs = np.asarray(axs).reshape(2, -1)
+        fig = axs[0, 0].figure
+    for i, (lab, c) in enumerate(C.items()):
+        col = ps.color(i)
+        for j, n in enumerate(names):
+            m = c[f"mean_{n}"]
+            axs[0, j].plot((m - m.min()) / (m.max() - m.min()), c.s_over_h, color=col,
+                           lw=ps.STYLE["line_width"])
+            f = c[f"flux_{n}"]
+            axs[1, j].plot(f / abs(f).max(), c.s_over_h, color=col, lw=ps.STYLE["line_width"])
+    for j, n in enumerate(names):
+        axs[0, j].set_title(n if n != "t" else r"$\theta$", fontsize=ps.STYLE["title_size"])
+        axs[0, j].set_xlabel(r"$(\langle c\rangle - c_{min})/\Delta c$")
+        axs[1, j].set_xlabel(r"$\langle w'c'\rangle$ / max$|\cdot|$")
+        axs[1, j].axvline(0, color="0.6", lw=0.6)
+        for r in range(2):
+            axs[r, j].axhline(0, color="0.6", lw=0.6, ls=":")
+            axs[r, j].grid(ps.STYLE["grid"])
+            axs[r, j].set_ylabel(r"$(z-h)/\langle h\rangle$" if j == 0 else "")
+    if len(C) > 1:
+        ps.run_legend(axs[0, 0], list(C), loc="lower right")
+    return fig, axs
