@@ -292,3 +292,194 @@ def entrainment_table(ent, momentum=True):
                  f"{g('we'):12.3g} {g('A'):9.3g} {g('E'):9.3g} {100 * g('sgs'):6.1f}"
                  + (f"   (+-{sd.get(f'we_{c}', np.nan):.2g})" if n > 1 else ""))
     return "\n".join(L)
+
+
+# ----------------------------------------------------------------------------
+# Budget: growth of the boundary layer
+# ----------------------------------------------------------------------------
+def _slope(t, y, half):
+    """Local linear-fit time derivative with +-half neighbours."""
+    out = np.full(t.size, np.nan)
+    for i in range(t.size):
+        s = slice(max(0, i - half), min(t.size, i + half + 1))
+        ok = np.isfinite(y[s])
+        if ok.sum() >= 3:
+            out[i] = np.polyfit(t[s][ok] - t[i], y[s][ok], 1)[0]
+    return out
+
+
+def entrainment_budget(prof, ent, scalars=None, divergence=0.0, smooth=2):
+    """Independent estimates of the entrainment rate from the evolution of the
+    boundary layer (needs several statistics windows).
+
+    w_e (growth) = d zi/dt + D zi        (D = large-scale divergence, 1/s; 0 = none)
+    F_e (budget) = F_s + <c>(zi) d zi/dt - d/dt int_0^zi <c> dz    for each scalar c
+    (mixed-layer budget with the Leibniz rule; it neglects horizontal advection,
+    forcing and sources / sinks inside the layer: for temperature it is exact
+    without radiation or subsidence, for decaying or reacting scalars it is not.)
+
+    prof : (time, z) profiles;  ent : output of `entrainment_rates` for the same profiles.
+    smooth : the time derivatives use a linear fit over +-smooth windows.
+    Returns a Dataset over time: dzidt, we_growth, and for each scalar
+    Fe_budget_c, Fe_c (measured), closure_c = budget / measured.
+    """
+    if "time" not in prof.dims or ent.time.size < 4:
+        raise ValueError("the budget needs at least 4 statistics windows")
+    t = ent.time.values.astype(float)
+    zi = ent.zi.values
+    dzidt = _slope(t, zi, smooth)
+    out = xr.Dataset({"zi": ("time", zi), "dzidt": ("time", dzidt),
+                      "we_growth": ("time", dzidt + divergence * zi)}, coords={"time": t})
+    z = prof.z.values
+    for c in resolve_scalars(prof, scalars):
+        # a constant reference is removed from the mean (the identity is unchanged,
+        # but big cancellations between c * dzi/dt and dI/dt are avoided)
+        cref = float(np.nanmean(ent[f"Cml_{c}"]))
+        I, Czi = np.full(t.size, np.nan), np.full(t.size, np.nan)
+        for i in range(t.size):
+            if not np.isfinite(zi[i]):
+                continue
+            C = prof[c.upper()].isel(time=i).values - cref
+            m = z <= zi[i]
+            Cz = np.interp(zi[i], z, C)
+            zz, CC = np.append(z[m], zi[i]), np.append(C[m], Cz)
+            I[i] = float(np.sum(0.5 * (CC[1:] + CC[:-1]) * np.diff(zz)))
+            Czi[i] = Cz
+        dI = _slope(t, I, smooth)
+        Fb = ent[f"Fs_{c}"].values + Czi * dzidt - dI
+        out[f"Fe_budget_{c}"] = ("time", Fb)
+        out[f"Fe_{c}"] = ("time", ent[f"Fe_{c}"].values)
+        out[f"closure_{c}"] = ("time", Fb / ent[f"Fe_{c}"].values)
+    out["we_t"] = ent["we_t"]
+    out.attrs.update(prof.attrs)
+    out.attrs.update(scalars="".join(resolve_scalars(prof, scalars)), divergence=divergence)
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Plots (profiles)
+# ----------------------------------------------------------------------------
+def _quantities(ent_or_prof, scalars, momentum):
+    syms = resolve_scalars(ent_or_prof, scalars)
+    return (["u", "v"] if momentum else []) + syms
+
+
+def plot_inversion(profs, scalars=None, momentum=False, zrange=(0.5, 1.5), ent=None, axs=None,
+                   evolution=None, title=None, **kw):
+    """The inversion of the time-averaged profiles, one column per quantity.
+
+    Top row: mean profile with the mixed-layer value, the extrapolated
+    free-atmosphere profile and the jump.  Bottom row: total flux / |surface
+    flux| with the entrainment zone shaded (colour = simulation).
+    profs : profile Dataset / list / dict.  Returns (fig, axs).
+    """
+    P = ps.as_dict(profs)
+    first = next(iter(P.values()))
+    qs = _quantities(first, scalars, momentum)
+    if axs is None:
+        fig, axs = ps.subplots(2, len(qs), kind="profile", sharey=False, figsize=(
+            ps.STYLE["panel_width"] * len(qs), 2 * ps.STYLE["panel_height"] * 0.8))
+        axs = np.asarray(axs).reshape(2, len(qs))
+    else:
+        axs = np.asarray(axs).reshape(2, -1)
+        fig = axs[0, 0].figure
+    kw_ent = {k: kw.pop(k) for k in ("method", "zmax", "frac", "ml", "ft_depth") if k in kw}
+    for i, (lab, p) in enumerate(P.items()):
+        e = entrainment_rates(p, qs, momentum=False, **kw_ent) if ent is None else ent[lab]
+        e = e if isinstance(e, dict) else {k: float(np.nanmean(v)) for k, v in e.data_vars.items()}
+        zi = e["zi"]
+        ml = kw_ent.get("ml", (0.2, 0.7))
+        col = ps.color(i)
+        for j, c in enumerate(qs):
+            a0, a1 = axs[0, j], axs[1, j]
+            zc = p.z / zi
+            sel = (zc >= 0) & (zc <= zrange[1])
+            C = p[c.upper()]
+            a0.plot(C.where(sel), zc.where(sel), color=col, lw=ps.STYLE["line_width"])
+            if np.isfinite(e.get(f"Delta_{c}", np.nan)):
+                a0.plot([e[f"Cml_{c}"]] * 2, ml, color=col, ls="--", lw=1.2)
+                zf = np.array([e["zt"] / zi, zrange[1]])
+                a0.plot(e[f"Cft_{c}"] + e[f"gamma_{c}"] * (zf - 1.0) * zi, zf, color=col, ls="-.",
+                        lw=1.2)
+                a0.annotate("", xy=(e[f"Cft_{c}"], 1.0), xytext=(e[f"Cml_{c}"], 1.0),
+                            arrowprops=dict(arrowstyle="<->", color=col, lw=1.0))
+            fv = _flux_var(p, c)
+            if fv is not None:
+                F0 = float(p[fv].isel(z=0))
+                norm = abs(F0) if abs(F0) > 1e-12 else 1.0
+                a1.plot((p[fv] / norm).where(sel), zc.where(sel), color=col, lw=ps.STYLE["line_width"])
+                if np.isfinite(e["zb"] + e["zt"]):
+                    a1.axhspan(e["zb"] / zi, e["zt"] / zi, color=col, alpha=0.12, lw=0)
+                a1.axhline(1.0, color=col, lw=0.6, ls=":")
+                a1.axvline(0, color="0.6", lw=0.6)
+            for a in (a0, a1):
+                a.set_ylim(*zrange)
+    for j, c in enumerate(qs):
+        axs[0, j].set_title(rf"${_q_label(first, c)}$" if c in "uvt" else _q_label(first, c))
+        axs[0, j].set_xlabel(ps.label(c.upper() if c in "uv" else c.upper()))
+        axs[1, j].set_xlabel(r"$F/|F_s|$" + f" ({_flux_var(first, c) or ''})".replace("_tot", ""))
+        for r in range(2):
+            axs[r, j].set_ylabel(ps.label("z/zi") if j == 0 else "")
+            axs[r, j].grid(ps.STYLE["grid"])
+    if len(P) > 1:
+        ps.run_legend(axs[0, 0], list(P), loc="lower right")
+    if title is None:
+        ps.average_title(fig, list(P.values())[0] if len(P) == 1 else P)
+    return fig, axs
+
+
+def plot_entrainment(ents, scalars=None, momentum=False, axs=None, labels=None):
+    """Time series of the entrainment diagnostics (Dataset or dict of Datasets
+    from `entrainment_rates`; colour = simulation, line style = quantity).
+
+    Panels: zi and entrainment zone | EZ depth / zi | w_e | A = -F_e/F_s |
+            SGS fraction of F_e | E = w_e/w* against Ri_w.
+    """
+    E = ps.as_dict(ents, labels)
+    first = next(iter(E.values()))
+    qs = _quantities(first, scalars, momentum)
+    if axs is None:
+        fig, axs = ps.subplots(2, 3, kind="wide", figsize=(3 * 3.4, 2 * 2.6))
+    else:
+        fig = axs.ravel()[0].figure
+    a = np.asarray(axs).ravel()
+    styles = ps.HEIGHT_STYLES
+    for i, (lab, e) in enumerate(E.items()):
+        col, t = ps.color(i), e.time
+        a[0].plot(t, e.zi, color=col, lw=ps.STYLE["line_width"])
+        a[0].fill_between(t, e.zb, e.zt, color=col, alpha=0.18, lw=0)
+        a[1].plot(t, e.ez / e.zi, color=col, label=lab, lw=ps.STYLE["line_width"])
+        a[1].plot(t, e.ez_grad / e.zi, color=col, ls=":", lw=ps.STYLE["line_width"])
+        for j, c in enumerate(qs):
+            ls_ = styles[j % len(styles)]
+            for ax_, var, f in ((a[2], f"we_{c}", 1.0), (a[3], f"A_{c}", 1.0),
+                                (a[4], f"sgs_{c}", 100.0)):
+                if var in e and np.isfinite(e[var]).any():
+                    ax_.plot(t, e[var] * f, color=col, ls=ls_, lw=ps.STYLE["line_width"])
+        if "Ri_w" in e and "E_t" in e:
+            a[5].scatter(e.Ri_w, e.E_t, c=t, cmap=ps.STYLE["evolution_cmap"], s=14, zorder=3,
+                              edgecolor=col, linewidth=0.8)
+    for ax_, yl in zip(a[:5], (r"$z_i$, EZ (m)", r"EZ depth$/z_i$", r"$w_e=-F_e/\Delta$ (m s$^{-1}$)",
+                               r"$A=-F_e/F_s$", "SGS share of $F_e$ (%)")):
+        ax_.set_ylabel(yl)
+        ax_.set_xlabel(ps.label("time"))
+    a[5].set_xlabel(r"$Ri_w$")
+    a[5].set_ylabel(r"$E=w_e/w_*$")
+    from matplotlib.ticker import NullFormatter
+    for axis, getl in (("x", a[5].get_xlim), ("y", a[5].get_ylim)):
+        lo, hi = getl()
+        if lo > 0 and hi / lo > 5:       # log axes only when the range spans a decade or so
+            getattr(a[5], f"set_{axis}scale")("log")
+            getattr(a[5], f"{axis}axis").set_minor_formatter(NullFormatter())
+    if len(qs) > 1:
+        from matplotlib.lines import Line2D
+        names = {"t": "temperature", **first.attrs.get("scalar_names", {}), "u": "U", "v": "V"}
+        h = [Line2D([], [], color="0.3", ls=styles[j % len(styles)], label=names.get(c, c))
+             for j, c in enumerate(qs)]
+        a[2].legend(handles=h, loc="best", fontsize=ps.STYLE["legend_size"])
+    if len(E) > 1:
+        ps.run_legend(a[1], list(E), loc="best")
+    a[1].set_title("solid: flux method, dotted: gradient FWHM", fontsize=ps.STYLE["legend_size"])
+    for ax_ in a:
+        ax_.grid(ps.STYLE["grid"])
+    return fig, axs
