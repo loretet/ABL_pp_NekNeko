@@ -483,3 +483,116 @@ def plot_entrainment(ents, scalars=None, momentum=False, axs=None, labels=None):
     for ax_ in a:
         ax_.grid(ps.STYLE["grid"])
     return fig, axs
+
+
+def plot_entrainment_budget(budgets, scalars=None, axs=None, labels=None):
+    """Entrainment from the evolution of the layer: w_e from the growth of zi
+    against the flux-based w_e, and F_e from the mixed-layer budget against
+    the measured F_e of each scalar (colour = simulation)."""
+    B = ps.as_dict(budgets, labels)
+    first = next(iter(B.values()))
+    syms = resolve_scalars(first, scalars)
+    names = {"t": "temperature", **first.attrs.get("scalar_names", {})}
+    n = 1 + len(syms)
+    if axs is None:
+        fig, axs = ps.subplots(1, n, kind="wide", figsize=(3.4 * n, 2.8))
+    else:
+        fig = np.asarray(axs).ravel()[0].figure
+    a = np.atleast_1d(axs).ravel()
+    for i, (lab, b) in enumerate(B.items()):
+        col = ps.color(i)
+        a[0].plot(b.time, b.we_t, color=col, lw=ps.STYLE["line_width"])
+        a[0].plot(b.time, b.we_growth, color=col, ls="--", lw=ps.STYLE["line_width"])
+        for k, c in enumerate(syms):
+            a[1 + k].plot(b.time, b[f"Fe_{c}"], color=col, lw=ps.STYLE["line_width"])
+            a[1 + k].plot(b.time, b[f"Fe_budget_{c}"], color=col, ls="--", lw=ps.STYLE["line_width"])
+            a[1 + k].set_title(names.get(c, c), fontsize=ps.STYLE["title_size"])
+            a[1 + k].set_ylabel(r"$F_e$ " + "(" + ps.label(f"w{c}").split("(")[-1])
+    a[0].set_ylabel(r"$w_e$ (m s$^{-1}$)")
+    a[0].set_title("entrainment velocity", fontsize=ps.STYLE["title_size"])
+    for ax_ in a:
+        ax_.set_xlabel(ps.label("time"))
+        ax_.grid(ps.STYLE["grid"])
+    from matplotlib.lines import Line2D
+    a[0].legend(handles=[Line2D([], [], color="0.3", label=r"flux: $-F_e/\Delta$"),
+                         Line2D([], [], color="0.3", ls="--", label=r"growth: $dz_i/dt + Dz_i$")],
+                loc="best", fontsize=ps.STYLE["legend_size"])
+    a[min(1, a.size - 1)].legend(handles=[Line2D([], [], color="0.3", label="measured at $z_i$"),
+                                          Line2D([], [], color="0.3", ls="--", label="mixed-layer budget")],
+                                 loc="best", fontsize=ps.STYLE["legend_size"])
+    if len(B) > 1:
+        ps.run_legend(a[-1], list(B), loc="lower right")
+    return fig, axs
+
+
+# ----------------------------------------------------------------------------
+# Fields
+# ----------------------------------------------------------------------------
+def field_scalars(fld, scalars=None):
+    """Names of the scalar variables of a field Dataset: attrs['scalar_fields']
+    (set by Run.fields) or, failing that, 't' plus unknown variables. `scalars`
+    (names, or None for all) selects some of them."""
+    known = fld.attrs.get("scalar_fields")
+    if known is None:
+        skip = set("uvwp") | {"e", "nut", "delta", "k"}
+        known = [v for v in fld.data_vars if v not in skip and "z" in fld[v].dims]
+    if scalars is None:
+        return list(known)
+    if isinstance(scalars, str):
+        scalars = [scalars]
+    out = []
+    for s in scalars:
+        hit = [k for k in known if k.lower() == s.lower() or (s.lower() in ("theta", "temperature") and k == "t")]
+        if not hit:
+            raise KeyError(f"scalar '{s}' not in the fields; available: {', '.join(known)}")
+        out += [h for h in hit if h not in out]
+    return out
+
+
+def inversion_height_map(fld, zi, sym="t", method="gradient", window=(0.6, 1.4)):
+    """Local inversion height h(x, y) [per snapshot].
+
+    method 'gradient': height of the maximum of d theta/dz of each column
+                       (parabolic refinement) within `window` * zi;
+    method 'isotherm': height where theta crosses the plane-mean value at zi
+                       (highest upward crossing within `window` * zi).
+    Returns a DataArray (time, y, x) (or (y, x) for one snapshot) in m.
+    """
+    th = fld[sym]
+    z = th.z.values
+    dims = [d for d in th.dims if d != "z"]
+    arr = th.transpose(*dims, "z").values
+    win = (z >= window[0] * zi) & (z <= window[1] * zi)
+    if win.sum() < 3:
+        raise ValueError("fewer than 3 grid points in the inversion window")
+    if method == "gradient":
+        G = sem.ddz(th, "z").transpose(*dims, "z").values
+        Gm = np.where(win, G, -np.inf)
+        k = np.clip(Gm.argmax(-1), 1, z.size - 2)
+        take = lambda a, kk: np.take_along_axis(a, kk[..., None], -1)[..., 0]  # noqa: E731
+        g0, g1, g2 = take(G, k - 1), take(G, k), take(G, k + 1)
+        z0, z1, z2 = z[k - 1], z[k], z[k + 1]
+        den = (z0 - z1) * (z0 - z2) * (z1 - z2)
+        A = (z2 * (g1 - g0) + z1 * (g0 - g2) + z0 * (g2 - g1)) / den
+        B = (z2**2 * (g0 - g1) + z1**2 * (g2 - g0) + z0**2 * (g1 - g2)) / den
+        with np.errstate(divide="ignore", invalid="ignore"):
+            zp = np.where(A < 0, -B / (2 * A), z1)
+        h = np.clip(zp, z0, z2)
+    elif method == "isotherm":
+        # plane-mean temperature at zi (per snapshot) as threshold
+        plane = fld[sym].mean([d for d in dims if d in ("x", "y")])
+        thr = np.interp(zi, z, plane.values) if plane.ndim == 1 else \
+            np.array([np.interp(zi, z, p) for p in plane.values])
+        thr = np.reshape(thr, thr.shape + (1,) * (arr.ndim - np.ndim(thr)))
+        below = (arr < thr) & win
+        last = z.size - 1 - below[..., ::-1].argmax(-1)           # highest 'below' node
+        last = np.clip(last, 0, z.size - 2)
+        take = lambda a, kk: np.take_along_axis(a, kk[..., None], -1)[..., 0]  # noqa: E731
+        a0, a1 = take(arr, last), take(arr, last + 1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            frac_ = np.clip((thr[..., 0] - a0) / (a1 - a0), 0, 1)
+        h = z[last] + frac_ * (z[last + 1] - z[last])
+    else:
+        raise ValueError("method must be 'gradient' or 'isotherm'")
+    coords = {d: th[d] for d in dims if d in th.coords}
+    return xr.DataArray(h, dims=dims, coords=coords, name="h", attrs={"units": "m", "method": method})
