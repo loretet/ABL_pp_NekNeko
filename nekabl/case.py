@@ -60,7 +60,90 @@ def find_case(folder):
 
 def read_case(path):
     """Parse a Neko .case file into a CaseInfo namespace (see module doc)."""
-    raise NotImplementedError
+    if os.path.isdir(path):
+        path = find_case(path)
+        if path is None:
+            raise FileNotFoundError("no .case file found")
+    with open(path) as f:
+        js = json.load(f)
+    case = js.get("case", js)
+    consts = {c["name"]: c["value"] for c in case.get("constants", [])}
+    case = _resolve(case, consts)
+    c = dict(DEFAULTS)
+    c["path"], c["json"] = os.path.abspath(path), case
+
+    num, tim, fl = case.get("numerics", {}), case.get("time", {}), case.get("fluid", {})
+    c["N"] = num.get("polynomial_order")
+    c["end_time"] = tim.get("end_time", case.get("end_time"))
+    c["variable_dt"] = tim.get("variable_timestep", case.get("variable_timestep"))
+    c["dt"] = tim.get("timestep", case.get("timestep"))
+    c["target_cfl"] = tim.get("target_cfl", case.get("target_cfl"))
+    c["max_dt"] = tim.get("max_timestep", case.get("max_timestep"))
+    c["field_output_value"] = fl.get("output_value")
+    rho = fl.get("rho", 1.0)
+    c["rho"] = rho
+    if "mu" in fl:
+        c["nu"] = fl["mu"] / rho
+    elif "Re" in fl:
+        c["nu"] = 1.0 / fl["Re"]
+
+    for st in fl.get("source_terms", []):
+        t = st.get("type", "")
+        if t == "boussinesq":
+            c["T0"] = st.get("reference_value")
+            gv = st.get("g")
+            if isinstance(gv, list):
+                c["g_vector"] = gv
+                c["g"] = float(np.linalg.norm(gv))
+        elif t == "coriolis":
+            if "rotation_vector" in st:
+                c["f"] = 2.0 * st["rotation_vector"][2]
+            elif "f" in st:
+                c["f"] = st["f"]
+            elif "omega" in st and "phi" in st:
+                c["f"] = 2.0 * st["omega"] * np.sin(np.deg2rad(st["phi"]))
+            c["u_geo"] = st.get("geostrophic_wind")
+        elif t == "sponge":
+            c["sponge"] = st
+
+    for bc in fl.get("boundary_conditions", []):
+        if bc.get("type") == "wall_model":
+            c["wall_model"] = bc.get("model")
+            c["kappa"] = bc.get("kappa", 0.4)
+            c["z0"] = bc.get("z0")
+            c["z0h"] = bc.get("z0h", bc.get("z0"))
+            c["Pr"] = bc.get("Pr")
+            c["h_index"] = bc.get("h_index")
+            c["temp_bc_type"] = bc.get("type_of_temp_bc")
+            val = bc.get("bottom_bc_flux_or_temp")
+            if c["temp_bc_type"] == "neumann":
+                c["surface_flux"] = val
+            elif c["temp_bc_type"] == "dirichlet":
+                c["surface_temperature"] = val
+            if c["g_vector"] is None and isinstance(bc.get("g"), list):
+                c["g_vector"] = bc["g"]
+                c["g"] = float(np.linalg.norm(bc["g"]))
+
+    c["scalars"] = [s.get("name", "s") for s in case.get("scalars", [])] or (
+        [case["scalar"].get("name", "s")] if "scalar" in case else [])
+
+    stats = []
+    for sc in case.get("simulation_components", []):
+        t = sc.get("type", "")
+        if t == "les_model":
+            c["les_model"] = sc.get("model")
+            c["les"] = sc
+            if isinstance(sc.get("T0"), (int, float)):     # Deardorff: own reference temperature
+                c["sgs_T0"] = float(sc["T0"])
+        if t.endswith("stats"):
+            stats.append(dict(type=t, field=sc.get("field"), start_time=sc.get("start_time", 0.0),
+                              avg_direction=sc.get("avg_direction"),
+                              set_of_stats=sc.get("set_of_stats", "full" if t in ("fluid_stats", "scalar_stats") else None),
+                              output_value=sc.get("output_value"), compute_value=sc.get("compute_value")))
+    c["stats"] = stats
+    fs = [s for s in stats if s["type"] == "fluid_stats"] or stats
+    c["stats_start_time"] = fs[0]["start_time"] if fs else None
+    return SimpleNamespace(**c)
 
 
 def describe(case):
