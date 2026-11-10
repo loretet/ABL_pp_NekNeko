@@ -177,3 +177,169 @@ def read_fluid_stats(path):
     ds = _read_restarts(path, FLUID_FULL if kind == "full" else FLUID_BASIC)
     ds.attrs["fluid_set"] = kind
     return ds
+
+
+def read_scalar_stats(path, sym="t"):
+    """scalar_stats csv; Neko 's' is renamed to `sym` (default 't')."""
+    kind = _guess_set(path, len(_SCALAR_BASIC), len(_SCALAR_FULL))
+    ds = _read_restarts(path, scalar_names(sym, kind == "full"))
+    ds.attrs[f"scalar_set_{sym}"] = kind
+    return ds
+
+
+def read_fluid_sgs_stats(path):
+    return _sgs_sign(_read_restarts(path, FLUID_SGS))
+
+
+def read_scalar_sgs_stats(path, sym="t"):
+    return _sgs_sign(_read_restarts(path, scalar_sgs_names(sym)))
+
+
+# ----------------------------------------------------------------------------
+# Time windows
+# ----------------------------------------------------------------------------
+def add_windows(ds, start_time=None):
+    """Store the averaging-window length of every time stamp as coord 'window'."""
+    t = ds.time.values
+    win = np.diff(t, prepend=np.nan)
+    if t.size == 1:
+        win[0] = (t[0] - start_time) if start_time is not None else 1.0
+    elif start_time is not None and start_time < t[0]:
+        win[0] = t[0] - start_time
+    else:
+        win[0] = win[1]
+    ds = ds.assign_coords(window=("time", win))
+    ds.window.attrs["description"] = "length of the averaging window ending at time"
+    return ds
+
+
+# ----------------------------------------------------------------------------
+# One-stop loader
+# ----------------------------------------------------------------------------
+def _first_existing(folder, stems):
+    for stem in stems:
+        p = os.path.join(folder, stem)
+        if glob.glob(p + "[0-9]*.csv"):
+            return p
+    return None
+
+
+def load_stats(folder, scalars=None, start_time=None, case=None, verbose=True):
+    """Load every Neko statistics CSV in `folder` into one raw Dataset (time, z).
+
+    Parameters
+    ----------
+    folder     : Neko output folder.
+    scalars    : {neko_field_name: symbol}, default {'temperature': 't'}.
+    start_time : statistics start_time (for the first window weight). If None
+                 it is taken from `case` (a CaseInfo from read_case) if given.
+    """
+    scalars = scalars or {"temperature": "t"}
+    if start_time is None and case is not None:
+        start_time = case.stats_start_time
+    parts, found = [], []
+
+    p = _first_existing(folder, ["fluid_stats"])
+    if p:
+        parts.append(read_fluid_stats(p)); found.append(f"fluid_stats ({parts[-1].attrs['fluid_set']})")
+    p = _first_existing(folder, ["fluid_sgs_stats"])
+    if p:
+        parts.append(read_fluid_sgs_stats(p)); found.append("fluid_sgs_stats")
+    for name, sym in scalars.items():
+        p = _first_existing(folder, [f"scalar_stats_{name}", "scalar_stats"])
+        if p:
+            parts.append(read_scalar_stats(p, sym))
+            found.append(f"scalar_stats_{name} ({parts[-1].attrs[f'scalar_set_{sym}']}) -> '{sym}'")
+        p = _first_existing(folder, [f"scalar_sgs_stats_{name}", "scalar_sgs_stats"])
+        if p:
+            parts.append(read_scalar_sgs_stats(p, sym)); found.append(f"scalar_sgs_stats ({name})")
+    if not parts:
+        raise FileNotFoundError(f"No Neko statistics csv found in {folder}")
+
+    ntimes = [d.time.size for d in parts]
+    N = next((d.z.attrs["N"] for d in parts if "N" in d.z.attrs), None)
+    attrs = {}
+    for d in parts:
+        attrs.update({k: v for k, v in d.attrs.items() if k not in ("source", "files")})
+    ds = xr.merge(parts, join="inner", compat="override", combine_attrs="drop")
+    if len(set(ntimes)) > 1:
+        warnings.warn(f"Stats files have different time stamps {ntimes}; kept the common ones "
+                      f"({ds.time.size}).")
+    if N is not None:
+        ds.z.attrs["N"] = N
+    ds.z.attrs["units"] = "m"
+    ds.attrs.update(attrs)
+    ds.attrs["start_time"] = start_time if start_time is not None else np.nan
+    ds = add_windows(ds, start_time)
+    if verbose:
+        print(f"[nekabl] loaded {', '.join(found)}")
+        print(f"[nekabl] {ds.time.size} windows, t = {ds.time.values[0]:.1f} ... "
+              f"{ds.time.values[-1]:.1f}, {ds.z.size} heights, N = {N}")
+    return ds
+
+
+# ----------------------------------------------------------------------------
+# Statistics stored as fld files (3D Neko stats, Nek5000)
+# ----------------------------------------------------------------------------
+_SLOTS = ["p", "u", "v", "w", "t"] + [f"s{i}" for i in range(1, 60)]
+
+
+def read_stats_fld(path, kind="fluid", sym="t", mesh=None):
+    """Horizontally average a 3D statistics fld file -> raw Dataset (time, z).
+
+    kind : 'fluid', 'scalar', 'fluid_sgs' or 'scalar_sgs' (Neko slot order).
+    Nek5000 KTH-toolbox 'sts' files follow the same 44-field fluid order
+    (assumed; check with your toolbox version).
+    """
+    from . import fields
+
+    ds3 = fields.read_field(path, mesh=mesh)
+    nvar = len(ds3.data_vars)
+    if kind == "fluid":
+        names = FLUID_FULL if nvar >= len(FLUID_FULL) else FLUID_BASIC
+    elif kind == "scalar":
+        names = scalar_names(sym, nvar >= len(_SCALAR_FULL))
+    elif kind == "fluid_sgs":
+        names = FLUID_SGS
+    elif kind == "scalar_sgs":
+        names = scalar_sgs_names(sym)
+    else:
+        raise ValueError(kind)
+    if nvar != len(names):
+        warnings.warn(f"{path}: {nvar} fields in the file, {len(names)} expected for '{kind}'")
+    out = xr.Dataset({n: fields.hmean(ds3[s]) for n, s in zip(names, _SLOTS) if s in ds3})
+    out = out.drop_vars([c for c in ("wz",) if c in out.coords]).expand_dims(time=[ds3.attrs["time"]])
+    out.z.attrs["N"] = ds3.attrs["N"]
+    return _sgs_sign(out) if "sgs" in kind else out
+
+
+def load_stats_fld(files, kind="fluid", sym="t", start_time=None, mesh=None):
+    """Series of 3D statistics fld files -> raw Dataset (time, z) with windows."""
+    files = sorted(glob.glob(files)) if isinstance(files, str) else list(files)
+    ds = xr.concat([read_stats_fld(f, kind, sym, mesh) for f in files], "time")
+    return add_windows(ds, start_time)
+
+
+def read_nek5000_avg(avg, rms, rm2=None, sym="t", mesh=None):
+    """Nek5000 avg_all output (avg*, rms*, rm2* files of the same time) -> raw
+    basic statistics (u v w p t uu vv ww pp tt [uv vw uw]) as Dataset (time, z).
+    Note: avg_all does not provide the heat fluxes <wt>."""
+    from . import fields
+
+    a = fields.read_field(avg, mesh=mesh)
+    r = fields.read_field(rms, mesh=mesh or fields._default_mesh(avg))
+    out = {k: fields.hmean(a[k]) for k in ("u", "v", "w", "p") if k in a}
+    if "t" in a:
+        out[sym] = fields.hmean(a["t"])
+        out[sym + sym] = fields.hmean(r["t"])
+    for k, n in (("u", "uu"), ("v", "vv"), ("w", "ww"), ("p", "pp")):
+        out[n] = fields.hmean(r[k])
+    if rm2 is not None:
+        r2 = fields.read_field(rm2, mesh=mesh or fields._default_mesh(avg))
+        for k, n in (("u", "uv"), ("v", "vw"), ("w", "uw")):
+            out[n] = fields.hmean(r2[k])
+    ds = xr.Dataset(out).expand_dims(time=[a.attrs["time"]])
+    ds = ds.drop_vars([c for c in ("wz",) if c in ds.coords])
+    ds.z.attrs["N"] = a.attrs["N"]
+    ds.attrs["fluid_set"] = "basic"
+    return add_windows(ds)
