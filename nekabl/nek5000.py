@@ -158,3 +158,143 @@ def read_par(path):
     section), SIZE (polynomial order) and .usr (f, u_geo, theta0, g, sampling
     height). Anything missing stays None: complete it with Run(case=dict(...))."""
     raise NotImplementedError
+
+
+def guess_field_prefix(folder, name=None):
+    """Prefix of the Nek5000 field files, e.g. 'n_160' for n_160.f00001
+    (case name + '0'). Uses the case name when known, else the commonest."""
+    if name and glob.glob(os.path.join(folder, f"{name}0.f[0-9]*")):
+        return f"{name}0"
+    cands = {}
+    for f in glob.glob(os.path.join(folder, "*0.f[0-9]*")):
+        pre = os.path.basename(f).split(".f")[0]
+        if not pre.startswith(("sts", "avg", "rms", "rm2", "stat", "pts", "his", "map")):
+            cands[pre] = cands.get(pre, 0) + 1
+    return max(cands, key=cands.get) if cands else "field0"
+
+
+# ----------------------------------------------------------------------------
+# KTH statistics
+# ----------------------------------------------------------------------------
+def read_sts(path, vertical="y", mesh=None, fields_map=None):
+    """One KTH 'sts' file -> raw statistics profile (time=1, z), package names."""
+    fields_map = fields_map or KTH_FIELDS
+    ds = _fields.read_field(path, mesh=mesh, vertical=vertical)
+    nvar = sum(bool(re.fullmatch(r"s\d+", k)) for k in ds.data_vars)
+    if nvar != len(fields_map):
+        print(f"[nekabl] {os.path.basename(path)}: {nvar} variables in the file but "
+              f"{len(fields_map)} in KTH_FIELDS -- check the variable order of your stat.f")
+    prof = {}
+    for k in ds.data_vars:
+        m = re.fullmatch(r"s(\d+)", k)
+        if not m or int(m.group(1)) not in fields_map:
+            continue
+        nek_name = fields_map[int(m.group(1))]
+        name, sign = rotate_name(nek_name) if vertical == "y" else (nek_name, 1)
+        prof[name] = sign * _fields.hmean(ds[k])
+    out = xr.Dataset(prof)
+    out = out.drop_vars([c for c in ("wz", "wy", "wx") if c in out.coords])
+    out = out.expand_dims(time=[ds.attrs["time"]])
+    out.z.attrs["N"] = ds.attrs["N"]
+    return out
+
+
+def _to_neko_raw(raw, nu=None, alpha=None, sym="t", scalar2=False):
+    """KTH extras -> the SGS names used by the package (stats.py convention):
+    uw_sgs ... (SGS stress, sign so that resolved + SGS = total), nut, alpha_t,
+    wt_sgs ..., SGS TKE 'k' and its transport flux 'dkdz_diff'."""
+    out = raw.copy()
+    xyz = {"u": "x", "v": "y", "w": "z"}
+    if all(f"nu_d{a}d{b}" in raw for a in "uvw" for b in "xyz"):
+        # total (molecular + SGS) stress: tau_ij = -<(nu+nut) (du_i/dx_j + du_j/dx_i)>
+        for a, b, name in (("u", "w", "uw_sgs"), ("v", "w", "vw_sgs"), ("u", "v", "uv_sgs")):
+            out[name] = -(raw[f"nu_d{a}d{xyz[b]}"] + raw[f"nu_d{b}d{xyz[a]}"])
+        for a in "uvw":
+            out[f"{a}{a}_sgs"] = -2 * raw[f"nu_d{a}d{xyz[a]}"]
+        out = out.drop_vars([f"nu_d{a}d{b}" for a in "uvw" for b in "xyz"])
+    if "nutot" in raw:
+        out["nut"] = raw.nutot - (nu or 0.0)
+        out = out.drop_vars("nutot")
+    if all(f"xi_dtd{b}" in raw for b in "xyz"):
+        for c, b in (("u", "x"), ("v", "y"), ("w", "z")):
+            out[f"{c}{sym}_sgs"] = -raw[f"xi_dtd{b}"]
+        out = out.drop_vars([f"xi_dtd{b}" for b in "xyz"])
+    if "xitot" in raw:
+        out[f"alpha_{sym}"] = raw.xitot - (alpha or 0.0)
+        out = out.drop_vars("xitot")
+    if scalar2 and "ks_dkdz" in out:
+        out["dkdz_diff"] = out["ks_dkdz"]
+    # scalar 2 (the SGS TKE) statistics are dropped unless scalar2=True: with
+    # user_stat_trnsv as in the stable_16_TKE case (only the first scalar is
+    # copied into `temp`) they do NOT contain the SGS TKE (see METHODS.md).
+    keep = ("k", "kk") if scalar2 else ()
+    drop = [v for v in ("k", "kk", "kkk", "kkkk", "uk", "vk", "wk", "dkdx", "dkdy", "dkdz",
+                        "ks_dkdx", "ks_dkdy", "ks_dkdz") if v in out and v not in keep]
+    out = out.drop_vars(drop)
+    return out
+
+
+def find_sts(folder, prefix=None):
+    pat = f"{prefix}*.f[0-9]*" if prefix else "sts*.f[0-9]*"
+    return sorted(glob.glob(os.path.join(folder, pat)))
+
+
+def load_stats(folder, case=None, start_time=None, prefix=None, vertical="y", mesh=None,
+               fields_map=None, tmin=None, sym="t", scalar2=False):
+    """All KTH statistics files of a Nek5000 run -> raw Dataset (time, z) in
+    package convention (as stats.load_stats). Files are sorted by time;
+    `tmin` drops earlier files (transient). scalar2=True keeps the statistics of
+    the second scalar (SGS TKE 'k', flux 'dkdz_diff'), only valid if your
+    user_stat_trnsv fills temp(...,2). Each file is the average over the
+    window since the previous write (the module resets its accumulators)."""
+    files = find_sts(folder, prefix)
+    if not files:
+        raise FileNotFoundError(f"no KTH statistics files (sts*.f*) in {folder}")
+    times = [_fields.read_header(f)["time"] for f in files]
+    order = np.argsort(times)
+    files = [files[i] for i in order if tmin is None or times[i] >= tmin]
+    dss = [read_sts(f, vertical, mesh, fields_map) for f in files]
+    raw = xr.concat(dss, "time").sortby("time")
+    _, keep = np.unique(raw.time.values, return_index=True)
+    raw = raw.isel(time=keep)
+    raw = _to_neko_raw(raw, nu=getattr(case, "nu", None), alpha=getattr(case, "alpha_mol", None),
+                       sym=sym, scalar2=scalar2)
+    raw.z.attrs["N"] = dss[0].z.attrs["N"]
+    n_fluid = sum(k in raw for k in _stats.FLUID_FULL)
+    raw.attrs["fluid_set"] = "full" if n_fluid == len(_stats.FLUID_FULL) else "basic"
+    raw.attrs["source"] = "Nek5000 KTH statistics"
+    if start_time is None and case is not None:
+        start_time = getattr(case, "stats_start_time", None)
+    return _stats.add_windows(raw, start_time)
+
+
+# ----------------------------------------------------------------------------
+# Extra time series written by the case (diagnostics.dat, wmles.dat)
+# ----------------------------------------------------------------------------
+def read_dat(path, names):
+    """Comma separated Fortran output (one row per time step) -> Dataset(time).
+    `names` are the column names after the time column."""
+    a = np.loadtxt(path, delimiter=",")
+    ds = xr.Dataset({n: ("time", a[:, i + 1]) for i, n in enumerate(names)},
+                    coords={"time": a[:, 0]})
+    return ds
+
+
+def read_step_series(folder, every=1):
+    """Per-step series of the case folder, if present:
+    diagnostics.dat -> ustar (torque on the wall), dt, cfl;
+    wmles.dat       -> wm_q (mean wall heat flux), wm_L (Obukhov length of the wall model).
+    Returns a Dataset(time) or None. `every` thins the (very long) series."""
+    out = []
+    d = os.path.join(folder, "diagnostics.dat")
+    if os.path.isfile(d):
+        out.append(read_dat(d, ["ustar", "dt", "cfl"]).isel(time=slice(None, None, every)))
+    w = os.path.join(folder, "wmles.dat")
+    if os.path.isfile(w):
+        a = np.loadtxt(w, delimiter=",")
+        ds = xr.Dataset({"wm_q": ("time", a[:, 1]), "wm_L": ("time", a[:, 2])},
+                        coords={"time": a[:, 0]})
+        out.append(ds.isel(time=slice(None, None, every)))
+    if not out:
+        return None
+    return xr.merge(out, join="outer") if len(out) > 1 else out[0]
