@@ -157,7 +157,81 @@ def read_par(path):
     """CaseInfo from a Nek5000 case folder: .par (general, viscosity, WMLES
     section), SIZE (polynomial order) and .usr (f, u_geo, theta0, g, sampling
     height). Anything missing stays None: complete it with Run(case=dict(...))."""
-    raise NotImplementedError
+    c = _case.case_from_dict({})
+    folders = [path, os.path.join(path, "compile"), os.path.dirname(os.path.abspath(path))]
+    pars = []
+    for d in folders:
+        pars += sorted(glob.glob(os.path.join(d, "*.par")))
+    if pars:
+        cp = configparser.ConfigParser(inline_comment_prefixes=("#",), interpolation=None)
+        cp.optionxform = str.lower
+        cp.read(pars[0])
+        sec = {s.lower(): {k.lower(): v for k, v in cp[s].items()} for s in cp.sections()}
+        gen, vel, wm = sec.get("general", {}), sec.get("velocity", {}), sec.get("_wmles", {})
+
+        def num(d, k):
+            return _fnum(d[k]) if k in d else None
+
+        c.path = os.path.abspath(pars[0])
+        c.json = sec
+        c.end_time = num(gen, "endtime")
+        c.dt = num(gen, "dt")
+        c.variable_dt = gen.get("variabledt", "no").lower() in ("yes", "true")
+        c.target_cfl = num(gen, "targetcfl")
+        c.field_output_value = num(gen, "writeinterval")
+        visc, rho = num(vel, "viscosity"), num(vel, "density") or 1.0
+        if visc is not None:
+            c.nu = (-1.0 / visc if visc < 0 else visc) / rho
+        c.user_params = {k: v for k, v in gen.items() if k.startswith("userparam")}
+        temp = sec.get("temperature", {})
+        c.alpha_mol = num(temp, "conductivity")
+        # KTH WMLES module
+        c.kappa = num(wm, "logkappa") or c.kappa
+        c.z0, c.z0h = num(wm, "z0"), num(wm, "z1")
+        c.T0 = num(wm, "theta0")
+        c.surface_temperature = num(wm, "tsurface")
+        if c.z0 is not None:
+            c.wall_model = "KTH WMLES (log law / MOST)"
+        c.les_model = "TKE" if "_spongebx" in sec or "tke" in os.path.basename(path).lower() else None
+        if "_stat" in sec:
+            c.stats = {"avstep": num(sec["_stat"], "avstep"), "iostep": num(sec["_stat"], "iostep")}
+    for d in folders:
+        size = os.path.join(d, "SIZE")
+        if os.path.isfile(size):
+            m = re.search(r"lx1\s*=\s*(\d+)", open(size).read(), re.I)
+            if m:
+                c.N = int(m.group(1)) - 1
+            break
+    usr = read_usr(path)
+    if "fcor" in usr:
+        # In the .usr the Coriolis force is (ffx, ffz) = (+f w, -f (u - ug)) with y up, i.e.
+        # in the z-up frame of the package dv/dt = +f_usr (u - ug): the rotation sense is the
+        # opposite of f > 0 (Southern-Hemisphere like: the wind veers to the right with height).
+        c.f = -usr["fcor"]
+    for key, attr in (("ugeo", "u_geo"), ("theta0", "T0"), ("g", "g")):
+        if key in usr:
+            if attr == "T0" and c.T0 is not None:
+                continue            # the WMLES theta0 (par) wins over a local constant
+            setattr(c, attr, usr[key])
+    if "sampling_h" in usr:
+        c.h = usr["sampling_h"]
+    if "surface_temperature_expr" in usr:      # e.g. '265 - 0.25/3600.0*time' (userbc)
+        c.surface_temperature_expr = usr["surface_temperature_expr"].replace("d", "e").replace("D", "e")
+    if c.z0 is not None:
+        c.temp_bc_type = "dirichlet"           # the KTH WMLES computes q from theta_s
+    for d in folders:       # constants of the one-equation SGS TKE model
+        tk = glob.glob(os.path.join(d, "sgs_models", "tke.f")) + glob.glob(os.path.join(d, "tke.f"))
+        if tk:
+            txt = open(tk[0], errors="ignore").read()
+            for key, attr in (("theta0", "sgs_T0"), ("g", "sgs_g")):
+                m = re.search(rf"parameter\s*\(\s*{key}\s*=\s*([-+0-9.eEdD]+)\s*\)", txt, re.I)
+                if m:
+                    setattr(c, attr, _fnum(m.group(1)))
+            break
+    c.stats_start_time = 0.0       # KTH statistics are accumulated from the first step
+    c.scalars = ["temperature", "tke"]
+    c.code = "nek5000"
+    return c
 
 
 def guess_field_prefix(folder, name=None):
