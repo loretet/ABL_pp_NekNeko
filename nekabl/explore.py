@@ -386,3 +386,59 @@ def explore(runs, labels=None, t0=None, t1=None, out="nekabl_figures", fmt="png"
     log(f"\n{len(saved)} figures written to {os.path.abspath(out)}")
     log.write()
     return saved
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Comprehensive exploration of Neko / Nek5000 ABL runs")
+    ap.add_argument("cases", nargs="*", help="case folders (Neko: with the .case; Nek5000: with .par/SIZE)")
+    ap.add_argument("--labels", nargs="*", default=None, help="legend names, one per case")
+    ap.add_argument("--t0", type=float, default=None, help="start of the averaging window (default: 2nd half)")
+    ap.add_argument("--t1", type=float, default=None, help="end of the averaging window")
+    ap.add_argument("--out", default=None, help="output folder for figures and summary.txt "
+                    "(default nekabl_figures)")
+    ap.add_argument("--format", default="png", help="figure format (png, pdf, svg)")
+    ap.add_argument("--evolution", nargs="*", type=float, default=None, metavar="T",
+                    help="also draw the profile of every statistics window as thin lines "
+                    "(one case only): no value -> the averaging window; two values -> "
+                    "from T0 to T1")
+    ap.add_argument("--zmax", type=float, default=None, help="top of the profile plots (m)")
+    ap.add_argument("--no-fields", action="store_true", help="do not read field files")
+    ap.add_argument("--last-fields", type=int, default=4, help="number of last snapshots to use "
+                    "(only those inside the averaging window)")
+    ap.add_argument("--rename", default=None, help="field slots, e.g. s1=e,s2=delta,s3=nut")
+    ap.add_argument("--set", default=None, help="case parameters, e.g. T0=263.5,z0=0.1,f=1.39e-4")
+    ap.add_argument("--config", default=None, help="JSON file with per-run options (see module doc)")
+    ap.add_argument("--scalars", nargs="*", default=None, metavar="NAME",
+                    help="scalars for the scalar / entrainment figures (names or symbols, "
+                    "e.g. --scalars co2 temperature); default: all")
+    ap.add_argument("--debug", action="store_true", help="print tracebacks of skipped figures")
+    a = ap.parse_args()
+
+    def kv(s, cast=str):
+        return {k: cast(v) for k, v in (x.split("=") for x in s.split(","))} if s else None
+
+    opts = dict(t0=a.t0, t1=a.t1, out=a.out or "nekabl_figures", fmt=a.format, zmax=a.zmax, use_fields=not a.no_fields,
+                last_fields=a.last_fields, verbose_errors=a.debug, scalars=a.scalars or None)
+    if a.evolution is not None:
+        if len(a.evolution) not in (0, 2):
+            ap.error("--evolution takes no value or two (T0 T1)")
+        opts["evolution"] = tuple(a.evolution) if a.evolution else True
+    rename, case = kv(a.rename), kv(a.set, float)
+    if a.config:
+        with open(a.config) as fh:
+            cfg = json.load(fh)
+        runs = [Run(c["path"], label=c.get("label"), rename=c.get("rename", rename),
+                    case=c.get("case", case), nek=c.get("nek"), field_prefix=c.get("field_prefix"))
+                for c in cfg["runs"]]
+        for k in ("t0", "t1", "out", "zmax", "scalars"):
+            if k in cfg and getattr(a, k, None) is None:
+                opts[k] = cfg[k]
+        explore(runs, **opts)
+    else:
+        if not a.cases:
+            ap.error("give at least one case folder (or --config)")
+        explore(a.cases, labels=a.labels, rename=rename, case=case, **opts)
+
+
+if __name__ == "__main__":
+    main()
